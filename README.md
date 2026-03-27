@@ -17,13 +17,13 @@ pipx install -e /Users/mkamar/Non_Work/Projects/maestro-android
 For another machine after release:
 
 ```bash
-pipx install git+https://github.com/Mohamad-Kamar/maestro-android.git@v0.1.0
+pipx install git+https://github.com/Mohamad-Kamar/maestro-android.git@vX.Y.Z
 ```
 
 If you want a pinned wheel instead of source install:
 
 ```bash
-pipx install https://github.com/Mohamad-Kamar/maestro-android/releases/download/v0.1.0/maestro_android-0.1.0-py3-none-any.whl
+pipx install https://github.com/Mohamad-Kamar/maestro-android/releases/download/vX.Y.Z/maestro_android-X.Y.Z-py3-none-any.whl
 ```
 
 ## Publish Options
