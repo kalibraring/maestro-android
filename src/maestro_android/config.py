@@ -53,6 +53,17 @@ class ScopedConfig(_StrictModel):
     app_context_regex: str = ""
 
 
+class CloudConfig(_StrictModel):
+    api_key_env: str = "MAESTRO_CLOUD_API_KEY"
+    project_id_env: str = "MAESTRO_PROJECT_ID"
+    device_locale: str = "en_US"
+    smoke_api_levels: list[int] = Field(default_factory=lambda: [34])
+    benchmark_api_levels: list[int] = Field(default_factory=lambda: [34, 33])
+    smoke_flows_root: str = "tests/maestro-cloud"
+    smoke_tags: list[str] = Field(default_factory=lambda: ["cloud-smoke"])
+    benchmark_flow: str = "tests/maestro-cloud/scenario-gpu-cpu-benchmark.yaml"
+
+
 class LaneConfig(_StrictModel):
     kind: Literal["test", "command"]
     argv: list[str] = Field(default_factory=list)
@@ -72,10 +83,12 @@ class MaestroAndroidConfig(_StrictModel):
     artifacts: ArtifactsConfig = Field(default_factory=ArtifactsConfig)
     flows: FlowConfig = Field(default_factory=FlowConfig)
     scoped: ScopedConfig = Field(default_factory=ScopedConfig)
+    cloud: CloudConfig = Field(default_factory=CloudConfig)
     lanes: dict[str, LaneConfig] = Field(
         default_factory=lambda: {
             "smoke": LaneConfig(kind="test", include_tags=["smoke"], label="smoke"),
             "full": LaneConfig(kind="test", label="full"),
+            "cloud-smoke": LaneConfig(kind="command", argv=["maestro-android", "cloud", "smoke"]),
         }
     )
 

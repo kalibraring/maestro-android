@@ -25,6 +25,37 @@ class CliTest(unittest.TestCase):
         self.assertEqual(0, exit_code)
         self.assertEqual([["bash", "smoke.sh"]], captured)
 
+    def test_main_dispatches_cloud_smoke(self) -> None:
+        captured: list[tuple[str, str]] = []
+        original = cli._run_cloud_smoke
+        try:
+            cli._run_cloud_smoke = lambda parsed, config, project_root: captured.append((parsed.cloud_command, str(project_root))) or 0  # type: ignore[assignment]
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / ".maestro-android.yaml").write_text("", encoding="utf-8")
+                exit_code = cli.main(["--project-root", str(root), "cloud", "smoke"])
+        finally:
+            cli._run_cloud_smoke = original  # type: ignore[assignment]
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual([("smoke", str(root.resolve()))], captured)
+
+    def test_main_dispatches_cloud_status(self) -> None:
+        captured: list[list[str]] = []
+        original = cli._run_cloud_status_command
+        try:
+            cli._run_cloud_status_command = lambda **kwargs: captured.append(list(kwargs["uploads"])) or 0  # type: ignore[assignment]
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / ".maestro-android.yaml").write_text("", encoding="utf-8")
+                (root / ".env").write_text("MAESTRO_CLOUD_API_KEY=abc\nMAESTRO_PROJECT_ID=proj\n", encoding="utf-8")
+                exit_code = cli.main(["--project-root", str(root), "cloud", "status", "a:1"])
+        finally:
+            cli._run_cloud_status_command = original  # type: ignore[assignment]
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual([["a:1"]], captured)
+
     def test_scoped_requires_title_description_comments(self) -> None:
         tmp_root = Path.cwd() / "tmp"
         tmp_root.mkdir(exist_ok=True)

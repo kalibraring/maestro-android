@@ -15,6 +15,8 @@ class ConfigTest(unittest.TestCase):
 
         self.assertEqual("app/build/outputs/apk/debug/*.apk", config.project.apk_glob)
         self.assertIn("smoke", config.lanes)
+        self.assertEqual("MAESTRO_CLOUD_API_KEY", config.cloud.api_key_env)
+        self.assertEqual("tests/maestro-cloud", config.cloud.smoke_flows_root)
 
     def test_load_config_merges_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -67,7 +67,10 @@ Core commands:
 - `trace`: show the latest trace-capable bundle and `trace.json`
 - `merge-reports`: merge multiple run manifests and JUnit outputs
 - `clean`: remove scratch artifacts
-- `cloud`: pass through to `maestro cloud`
+- `cloud run`: pass through to `maestro cloud`
+- `cloud smoke`: hosted `cloud-smoke` suite with build, APK resolution, and API-level fan-out
+- `cloud benchmark`: hosted GPU-vs-CPU benchmark fan-out
+- `cloud status`: poll upload ids from Maestro Cloud
 
 ## Config
 
@@ -103,10 +106,18 @@ Pocket-GPT’s config is included as a worked example in `examples/pocket-gpt/ma
 
 Recommended distribution model:
 
-1. Push a tag that matches `v*`, for example `v0.1.1`.
+1. Push a tag that matches `v*`, for example `vX.Y.Z`.
 2. GitHub Actions builds the wheel and sdist.
 3. GitHub Releases gets the assets automatically.
-4. Install elsewhere with `pipx install git+https://github.com/Mohamad-Kamar/maestro-android.git@v0.1.1`.
+4. Install elsewhere with `pipx install git+https://github.com/Mohamad-Kamar/maestro-android.git@vX.Y.Z`.
+
+Cloud usage:
+
+```bash
+maestro-android cloud smoke
+maestro-android cloud benchmark
+maestro-android cloud status label:upload-id
+```
 
 Choose and add a real `LICENSE` file before publishing publicly.
 

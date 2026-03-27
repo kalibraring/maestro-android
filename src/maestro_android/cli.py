@@ -6,10 +6,13 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 from maestro_android.common import MaestroAndroidError, print_step, run_subprocess
 from maestro_android.config import LaneConfig, MaestroAndroidConfig, load_config
@@ -75,8 +78,32 @@ def _build_parser() -> argparse.ArgumentParser:
     clean = subparsers.add_parser("clean", help="remove maestro-android scratch artifacts")
     clean.add_argument("--include-repo-artifacts", action="store_true")
 
-    cloud = subparsers.add_parser("cloud", help="pass through to maestro cloud")
-    cloud.add_argument("args", nargs=argparse.REMAINDER, help="arguments for maestro cloud")
+    cloud = subparsers.add_parser("cloud", help="run hosted Maestro workflows")
+    cloud_subparsers = cloud.add_subparsers(dest="cloud_command", required=True)
+
+    cloud_run = cloud_subparsers.add_parser("run", help="pass through to maestro cloud")
+    cloud_run.add_argument("args", nargs=argparse.REMAINDER, help="arguments for maestro cloud")
+
+    cloud_smoke = cloud_subparsers.add_parser("smoke", help="run the hosted cloud-smoke suite")
+    cloud_smoke.add_argument("--api-levels", default="", help="comma-separated Android API levels")
+    cloud_smoke.add_argument("--no-build", action="store_true")
+    cloud_smoke.add_argument("--project-id", default="", help="override Maestro Cloud project id")
+    cloud_smoke.add_argument("--device-locale", default="", help="override device locale")
+    cloud_smoke.add_argument("--flows-root", default="", help="override hosted smoke flows root")
+    cloud_smoke.add_argument("--tags", default="", help="override tag filter")
+
+    cloud_benchmark = cloud_subparsers.add_parser("benchmark", help="run the hosted GPU-vs-CPU benchmark")
+    cloud_benchmark.add_argument("--api-levels", default="", help="comma-separated Android API levels")
+    cloud_benchmark.add_argument("--no-build", action="store_true")
+    cloud_benchmark.add_argument("--project-id", default="", help="override Maestro Cloud project id")
+    cloud_benchmark.add_argument("--device-locale", default="", help="override device locale")
+    cloud_benchmark.add_argument("--flow", default="", help="override benchmark flow path")
+
+    cloud_status = cloud_subparsers.add_parser("status", help="poll Maestro Cloud upload status")
+    cloud_status.add_argument("--project-id", default="", help="override Maestro Cloud project id")
+    cloud_status.add_argument("--watch", action="store_true")
+    cloud_status.add_argument("--interval", type=int, default=60)
+    cloud_status.add_argument("uploads", nargs="+", help="label:upload-id entries")
 
     return parser
 
@@ -97,6 +124,33 @@ def _parse_csv(raw: str) -> list[str]:
     return [token.strip() for token in raw.split(",") if token.strip()]
 
 
+def _parse_int_csv(raw: str) -> list[int]:
+    values: list[int] = []
+    for token in _parse_csv(raw):
+        try:
+            values.append(int(token))
+        except ValueError as exc:
+            raise MaestroAndroidError("CONFIG_ERROR", f"Invalid integer list value: {token}") from exc
+    return values
+
+
+def _load_env_file(project_root: Path) -> None:
+    env_path = project_root / ".env"
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("\"").strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
 def _resolve_serial(explicit: str) -> str:
     if explicit:
         return explicit
@@ -110,6 +164,159 @@ def _resolve_serial(explicit: str) -> str:
     if len(devices) > 1:
         raise MaestroAndroidError("DEVICE_ERROR", "Multiple adb devices detected; pass --device.")
     return devices[0]
+
+
+def _cloud_project_id(parsed: argparse.Namespace, config: MaestroAndroidConfig, project_root: Path) -> str:
+    explicit = getattr(parsed, "project_id", "") or ""
+    if explicit:
+        return explicit
+    env_value = os.environ.get(config.cloud.project_id_env, "")
+    if env_value:
+        return env_value
+    raise MaestroAndroidError(
+        "CONFIG_ERROR",
+        f"Set --project-id or {config.cloud.project_id_env} in the project environment.",
+    )
+
+
+def _cloud_api_key(config: MaestroAndroidConfig) -> str:
+    value = os.environ.get(config.cloud.api_key_env, "")
+    if value:
+        return value
+    raise MaestroAndroidError(
+        "CONFIG_ERROR",
+        f"Set {config.cloud.api_key_env} in the project environment.",
+    )
+
+
+def _build_apk_if_needed(project_root: Path, config: MaestroAndroidConfig, no_build: bool) -> Path:
+    if not no_build:
+        run_subprocess(config.project.build_command, cwd=project_root)
+    apk_path = _resolve_apk(project_root, config)
+    if apk_path is None:
+        raise MaestroAndroidError("CONFIG_ERROR", f"No APK matched {config.project.apk_glob}")
+    return apk_path
+
+
+def _run_cloud_maestro(
+    *,
+    project_root: Path,
+    apk_path: Path,
+    api_level: int,
+    device_locale: str,
+    flows: Path,
+    include_tags: list[str],
+    project_id: str,
+    output_path: Path,
+    extra_args: Sequence[str] = (),
+) -> subprocess.CompletedProcess[str]:
+    command = [
+        "maestro",
+        "cloud",
+        "--project-id",
+        project_id,
+        "--android-api-level",
+        str(api_level),
+        "--device-locale",
+        device_locale,
+        "--app-file",
+        str(apk_path),
+        "--flows",
+        str(flows),
+        "--format",
+        "junit",
+        "--output",
+        str(output_path),
+        *extra_args,
+    ]
+    for tag in include_tags:
+        command.extend(["--include-tags", tag])
+    return run_subprocess(command, capture_output=True, check=False, cwd=project_root)
+
+
+def _run_cloud_smoke(parsed: argparse.Namespace, config: MaestroAndroidConfig, project_root: Path) -> int:
+    _load_env_file(project_root)
+    _cloud_api_key(config)
+    project_id = _cloud_project_id(parsed, config, project_root)
+    api_levels = _parse_int_csv(parsed.api_levels) if parsed.api_levels else list(config.cloud.smoke_api_levels)
+    device_locale = parsed.device_locale or config.cloud.device_locale
+    flows_root = Path(parsed.flows_root or config.cloud.smoke_flows_root)
+    include_tags = _parse_csv(parsed.tags) if parsed.tags else list(config.cloud.smoke_tags)
+    apk_path = _build_apk_if_needed(project_root, config, parsed.no_build)
+
+    output_root = project_root / "tmp" / "maestro-cloud-smoke"
+    output_root.mkdir(parents=True, exist_ok=True)
+    exit_code = 0
+    for api_level in api_levels:
+        run_dir = output_root / f"api-{api_level}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        completed = _run_cloud_maestro(
+            project_root=project_root,
+            apk_path=apk_path,
+            api_level=api_level,
+            device_locale=device_locale,
+            flows=flows_root,
+            include_tags=include_tags,
+            project_id=project_id,
+            output_path=run_dir / "junit.xml",
+        )
+        (run_dir / "run.log").write_text((completed.stdout or "") + (completed.stderr or ""), encoding="utf-8")
+        _write_json(
+            run_dir / "summary.json",
+            {
+                "api_level": api_level,
+                "project_id": project_id,
+                "device_locale": device_locale,
+                "flows": str(flows_root),
+                "returncode": completed.returncode,
+            },
+        )
+        if completed.returncode != 0:
+            exit_code = 1
+    print_step(f"Maestro Cloud smoke artifacts: {output_root}")
+    return exit_code
+
+
+def _run_cloud_benchmark(parsed: argparse.Namespace, config: MaestroAndroidConfig, project_root: Path) -> int:
+    _load_env_file(project_root)
+    _cloud_api_key(config)
+    project_id = _cloud_project_id(parsed, config, project_root)
+    api_levels = _parse_int_csv(parsed.api_levels) if parsed.api_levels else list(config.cloud.benchmark_api_levels)
+    device_locale = parsed.device_locale or config.cloud.device_locale
+    flow = Path(parsed.flow or config.cloud.benchmark_flow)
+    apk_path = _build_apk_if_needed(project_root, config, parsed.no_build)
+
+    output_root = project_root / "tmp" / "maestro-cloud-gpu-benchmark"
+    output_root.mkdir(parents=True, exist_ok=True)
+    exit_code = 0
+    for api_level in api_levels:
+        run_dir = output_root / f"api-{api_level}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        completed = _run_cloud_maestro(
+            project_root=project_root,
+            apk_path=apk_path,
+            api_level=api_level,
+            device_locale=device_locale,
+            flows=flow,
+            include_tags=[],
+            project_id=project_id,
+            output_path=run_dir / "junit.xml",
+        )
+        (run_dir / "run.log").write_text((completed.stdout or "") + (completed.stderr or ""), encoding="utf-8")
+        _write_json(
+            run_dir / "summary.json",
+            {
+                "api_level": api_level,
+                "project_id": project_id,
+                "device_locale": device_locale,
+                "flow": str(flow),
+                "returncode": completed.returncode,
+            },
+        )
+        if completed.returncode != 0:
+            exit_code = 1
+    print_step(f"Maestro Cloud benchmark artifacts: {output_root}")
+    return exit_code
 
 
 def _project_root(parsed: argparse.Namespace) -> Path:
@@ -579,11 +786,90 @@ def _run_clean(parsed: argparse.Namespace, config: MaestroAndroidConfig) -> None
             shutil.rmtree(root)
 
 
-def _run_cloud(parsed: argparse.Namespace) -> None:
-    extra_args = list(parsed.args)
-    if extra_args and extra_args[0] == "--":
-        extra_args = extra_args[1:]
-    run_subprocess(["maestro", "cloud", *extra_args], cwd=_project_root(parsed))
+def _cloud_request_json(project_id: str, upload_id: str, api_key: str) -> dict[str, Any]:
+    url = f"https://api.copilot.mobile.dev/v2/project/{project_id}/upload/{upload_id}"
+    request = Request(url, headers={"Authorization": f"Bearer {api_key}"})
+    try:
+        with urlopen(request, timeout=30) as response:
+            payload = response.read().decode("utf-8")
+    except URLError as exc:
+        raise MaestroAndroidError("ENVIRONMENT_ERROR", f"Failed to query Maestro Cloud upload {upload_id}: {exc}") from exc
+    return json.loads(payload)
+
+
+def _first_cloud_flow(payload: dict[str, Any]) -> dict[str, Any]:
+    flows = payload.get("flows") or []
+    if flows and isinstance(flows[0], dict):
+        return flows[0]
+    return {}
+
+
+def _print_cloud_status_row(label: str, upload_id: str, payload: dict[str, Any]) -> None:
+    first_flow = _first_cloud_flow(payload)
+    print(
+        f"{label:<18} {upload_id:<28} {str(payload.get('status', '')):<10} "
+        f"{str(first_flow.get('status', '')):<10} "
+        f"{str(payload.get('completed', '')):<8} {str(payload.get('wasAppLaunched', '')):<12} "
+        f"{' | '.join(first_flow.get('errors') or [])}"
+    )
+
+
+def _run_cloud_status_command(
+    *,
+    project_id: str,
+    api_key: str,
+    uploads: Sequence[str],
+    watch: bool,
+    interval: int,
+) -> int:
+    def poll_once() -> bool:
+        print(f"{'label':<18} {'upload_id':<28} {'upload':<10} {'flow':<10} {'done':<8} {'launched':<12} errors")
+        all_done = True
+        for entry in uploads:
+            if ":" not in entry:
+                raise MaestroAndroidError("CONFIG_ERROR", f"Upload entry must be label:upload-id, got {entry}")
+            label, upload_id = entry.split(":", 1)
+            payload = _cloud_request_json(project_id, upload_id, api_key)
+            _print_cloud_status_row(label, upload_id, payload)
+            if not payload.get("completed", False):
+                all_done = False
+        return all_done
+
+    if not watch:
+        poll_once()
+        return 0
+
+    while True:
+        print(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        if poll_once():
+            return 0
+        print()
+        time.sleep(interval)
+
+
+def _run_cloud(parsed: argparse.Namespace, config: MaestroAndroidConfig, project_root: Path) -> int:
+    if parsed.cloud_command == "run":
+        extra_args = list(parsed.args)
+        if extra_args and extra_args[0] == "--":
+            extra_args = extra_args[1:]
+        run_subprocess(["maestro", "cloud", *extra_args], cwd=project_root)
+        return 0
+    if parsed.cloud_command == "smoke":
+        return _run_cloud_smoke(parsed, config, project_root)
+    if parsed.cloud_command == "benchmark":
+        return _run_cloud_benchmark(parsed, config, project_root)
+    if parsed.cloud_command == "status":
+        _load_env_file(project_root)
+        api_key = _cloud_api_key(config)
+        project_id = _cloud_project_id(parsed, config, project_root)
+        return _run_cloud_status_command(
+            project_id=project_id,
+            api_key=api_key,
+            uploads=parsed.uploads,
+            watch=parsed.watch,
+            interval=parsed.interval,
+        )
+    raise MaestroAndroidError("CONFIG_ERROR", f"Unknown cloud command '{parsed.cloud_command}'")
 
 
 def _run_doctor(parsed: argparse.Namespace, config: MaestroAndroidConfig) -> int:
@@ -620,6 +906,13 @@ def _run_doctor(parsed: argparse.Namespace, config: MaestroAndroidConfig) -> int
             "ok": (parsed.config is not None and parsed.config.exists()) or (project_root / ".maestro-android.yaml").exists(),
         }
     )
+    checks.append(
+        {
+            "name": config.cloud.api_key_env,
+            "kind": "optional-cloud-env",
+            "ok": bool(os.environ.get(config.cloud.api_key_env)),
+        }
+    )
     adb_ok = shutil.which("adb") is not None
     if adb_ok:
         completed = run_subprocess(["adb", "devices"], capture_output=True, check=False, cwd=project_root)
@@ -631,7 +924,7 @@ def _run_doctor(parsed: argparse.Namespace, config: MaestroAndroidConfig) -> int
         for check in checks:
             status = "ok" if check["ok"] else "missing"
             print(f"{status:7} {check['kind']:17} {check['name']}")
-    return 0 if all(check["ok"] or check["kind"] == "optional-command" for check in checks) else 1
+    return 0 if all(check["ok"] or check["kind"] in {"optional-command", "optional-cloud-env"} for check in checks) else 1
 
 
 def _run_devices() -> None:
@@ -697,8 +990,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             _run_clean(parsed, config)
             return 0
         if parsed.command == "cloud":
-            _run_cloud(parsed)
-            return 0
+            return _run_cloud(parsed, config, project_root)
         raise MaestroAndroidError("CONFIG_ERROR", f"Unknown command '{parsed.command}'")
     except MaestroAndroidError as exc:
         print(f"{exc.code}: {exc.message}")
