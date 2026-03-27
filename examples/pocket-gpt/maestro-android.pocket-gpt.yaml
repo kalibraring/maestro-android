@@ -1,0 +1,98 @@
+project:
+  apk_glob: apps/mobile-android/build/outputs/apk/debug/*.apk
+  build_command:
+    - ./gradlew
+    - --no-daemon
+    - :apps:mobile-android:assembleDebug
+  install_command:
+    - ./gradlew
+    - --no-daemon
+    - :apps:mobile-android:installDebug
+  app_id: com.pocketagent.android
+  test_app_id: com.pocketagent.android.test
+
+doctor:
+  required_commands:
+    - adb
+    - maestro
+    - python3
+  optional_commands:
+    - emulator
+  require_gradlew: true
+
+artifacts:
+  scratch_root: .maestro-android/runs
+  report_roots:
+    - .maestro-android/runs
+    - scripts/benchmarks/runs
+    - tmp/devctl-artifacts
+  lifecycle_root: tmp/lifecycle-e2e-first-run
+  clean_roots:
+    - .maestro-android
+    - tmp/lifecycle-e2e-first-run
+
+flows:
+  roots:
+    - tests/maestro
+    - tests/maestro-cloud
+
+scoped:
+  require_tmp_flow: true
+  require_title_description_comments: true
+  crash_signature_regex: "FATAL EXCEPTION|Fatal signal|SIGSEGV|Abort message|Runtime: Error|nativeLoadModel|pocket_llama|UI-RUNTIME-001"
+  app_context_regex: "com\\.pocketagent\\.android|PocketLlamaJNI|libpocket_llama|Cmdline: com\\.pocketagent\\.android|Process: com\\.pocketagent\\.android|UI-RUNTIME-001"
+
+lanes:
+  smoke:
+    kind: command
+    argv:
+      - python3
+      - tools/devctl/main.py
+      - lane
+      - maestro
+  journey:
+    kind: command
+    argv:
+      - python3
+      - tools/devctl/main.py
+      - lane
+      - journey
+  screenshot-pack:
+    kind: command
+    argv:
+      - python3
+      - tools/devctl/main.py
+      - lane
+      - screenshot-pack
+  lifecycle:
+    kind: command
+    argv:
+      - bash
+      - scripts/ci/run_lifecycle_e2e.sh
+      - local-manual
+  cloud-smoke:
+    kind: command
+    argv:
+      - bash
+      - scripts/dev/maestro-cloud-smoke.sh
+  fast-smoke:
+    kind: command
+    argv:
+      - python3
+      - tools/devctl/main.py
+      - lane
+      - fast-smoke
+  valid-output:
+    kind: command
+    argv:
+      - python3
+      - tools/devctl/main.py
+      - lane
+      - valid-output
+  strict-journey:
+    kind: command
+    argv:
+      - python3
+      - tools/devctl/main.py
+      - lane
+      - strict-journey
