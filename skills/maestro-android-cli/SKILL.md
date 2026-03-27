@@ -12,6 +12,7 @@ Use this skill for the standalone `maestro-android` companion CLI.
 - Run or debug Maestro flows in an Android project.
 - Set up `.maestro-android.yaml` for a new repo.
 - Inspect `doctor`, `lane`, `scoped`, `report`, `trace`, or `cloud` output.
+- Scaffold a starter config with `maestro-android init`.
 - Package or publish the CLI for local or shared use.
 
 ## Prerequisites
@@ -23,15 +24,17 @@ Use this skill for the standalone `maestro-android` companion CLI.
 ## Core Workflow
 
 1. Start with `maestro-android doctor`.
-2. Confirm the project root and config path if the repo is not the current directory.
-3. Use `maestro-android lane <name>` for canonical local flows.
-4. Use `maestro-android scoped --flow tmp/<name>.yaml` for one-off crash or hang repros.
-5. Use `maestro-android report latest` or `maestro-android trace latest` to inspect the newest artifacts.
-6. Use `maestro-android cloud smoke|benchmark|status` for hosted Maestro workflows.
+2. Use `maestro-android init` when a repo does not yet have `.maestro-android.yaml`.
+3. Confirm the project root and config path if the repo is not the current directory.
+4. Use `maestro-android lane <name>` for canonical local flows.
+5. Use `maestro-android scoped --flow tmp/<name>.yaml` for one-off crash or hang repros.
+6. Use `maestro-android report latest` or `maestro-android trace latest` to inspect the newest artifacts.
+7. Use `maestro-android cloud smoke|benchmark|status` for hosted Maestro workflows.
 
 ## Command Surface
 
 - `doctor`
+- `init`
 - `devices`
 - `start-device`
 - `test`
@@ -46,6 +49,7 @@ Use this skill for the standalone `maestro-android` companion CLI.
 - `cloud benchmark`
 - `cloud status`
 
+See `references/testing-map.md` for the recommended testing ladder and when to use each command.
 See `references/command-reference.md` for setup and concrete examples.
 
 ## Publishing

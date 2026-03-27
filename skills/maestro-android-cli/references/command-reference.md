@@ -4,12 +4,13 @@
 
 ```bash
 pipx install -e /path/to/maestro-android
-cp /path/to/maestro-android/examples/pocket-gpt/maestro-android.pocket-gpt.yaml .maestro-android.yaml
+maestro-android init
 ```
 
 ## Local Workflow
 
 - `maestro-android doctor` checks Android tooling, `adb`, `maestro`, `gradlew`, and config presence.
+- `maestro-android init` writes a starter `.maestro-android.yaml`.
 - `maestro-android lane smoke` runs the stable smoke flow set.
 - `maestro-android lane journey` and `maestro-android lane screenshot-pack` inspect structured evidence outputs.
 - `maestro-android scoped` is the fast one-flow repro path for crashes, hangs, or runtime regressions.

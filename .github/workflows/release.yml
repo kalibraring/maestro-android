@@ -31,6 +31,9 @@ jobs:
       - name: Run tests
         run: python -m unittest discover -s tests
 
+      - name: Sanity check
+        run: maestro-android --version
+
       - name: Build distribution artifacts
         run: python -m build
 

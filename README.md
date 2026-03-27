@@ -1,5 +1,8 @@
 # maestro-android
 
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://pypi.org/project/maestro-android/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 `maestro-android` is a standalone companion CLI for Android projects that use [Maestro](https://maestro.mobile.dev/). It adds the higher-level workflow that Android teams usually end up rebuilding locally: build/install bootstrap, device selection, lane commands, scoped repros, structured artifacts, report lookup, and report merging.
 
 It is intentionally project-agnostic. Repo-specific behavior belongs in `.maestro-android.yaml`, not in the package code.
@@ -48,6 +51,7 @@ Run the CLI from the Android project root, or point it at a project explicitly:
 
 ```bash
 maestro-android doctor
+maestro-android init
 maestro-android test --include-tags smoke
 maestro-android lane smoke
 maestro-android scoped --flow tmp/repro.yaml
@@ -58,6 +62,7 @@ maestro-android --project-root /path/to/project doctor
 Core commands:
 
 - `doctor`: verify `adb`, `maestro`, optional emulator tooling, `gradlew`, and config presence
+- `init`: write a starter `.maestro-android.yaml` for the current project
 - `devices`: list connected adb devices
 - `start-device`: start an AVD and wait for adb
 - `test`: run one or more flows with build/install bootstrap and structured artifacts
@@ -75,6 +80,7 @@ Core commands:
 ## Config
 
 Place `.maestro-android.yaml` in the target project root.
+If you want a starter file, run `maestro-android init`.
 
 Minimal example:
 
