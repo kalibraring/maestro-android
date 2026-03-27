@@ -55,5 +55,5 @@ See `references/command-reference.md` for setup and concrete examples.
 ## Publishing
 
 - For local machine installs, prefer `pipx install -e /path/to/maestro-android`.
-- For other machines, prefer `pipx install git+https://github.com/<user>/maestro-android.git@vX.Y.Z`.
+- For other machines, prefer `pipx install git+https://github.com/kalibraring/maestro-android.git@vX.Y.Z`.
 - For skills.sh distribution, keep this `skills/maestro-android-cli/` folder intact and publish the repo as-is.

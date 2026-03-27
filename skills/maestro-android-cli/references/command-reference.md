@@ -36,4 +36,4 @@ maestro-android init
 - Push a `v*` tag to the GitHub repo.
 - GitHub Actions builds the wheel and sdist.
 - GitHub Releases gets the assets automatically.
-- Other machines can then install with `pipx install git+https://github.com/<user>/maestro-android.git@vX.Y.Z`.
+- Other machines can then install with `pipx install git+https://github.com/kalibraring/maestro-android.git@vX.Y.Z`.

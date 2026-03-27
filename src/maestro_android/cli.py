@@ -42,7 +42,7 @@ def _build_parser() -> argparse.ArgumentParser:
   maestro-android report latest                   # View latest test artifacts
   maestro-android cloud smoke                     # Run hosted smoke suite
   
-For full docs, see: https://github.com/Mohamad-Kamar/maestro-android""",
+For full docs, see: https://github.com/kalibraring/maestro-android""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(

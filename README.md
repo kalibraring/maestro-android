@@ -20,13 +20,13 @@ pipx install -e .
 For another machine after release:
 
 ```bash
-pipx install git+https://github.com/Mohamad-Kamar/maestro-android.git@vX.Y.Z
+pipx install git+https://github.com/kalibraring/maestro-android.git@vX.Y.Z
 ```
 
 If you want a pinned wheel instead of source install:
 
 ```bash
-pipx install https://github.com/Mohamad-Kamar/maestro-android/releases/download/vX.Y.Z/maestro_android-X.Y.Z-py3-none-any.whl
+pipx install https://github.com/kalibraring/maestro-android/releases/download/vX.Y.Z/maestro_android-X.Y.Z-py3-none-any.whl
 ```
 
 ## Publish Options
@@ -41,7 +41,7 @@ Ways to publish this tool:
 Simplest and best for this tool right now:
 
 1. GitHub Releases, generated automatically from a tag push.
-2. Install on other machines with `pipx install git+https://github.com/Mohamad-Kamar/maestro-android.git@vX.Y.Z`.
+2. Install on other machines with `pipx install git+https://github.com/kalibraring/maestro-android.git@vX.Y.Z`.
 
 That keeps publishing one-step on my side, needs no manual asset upload, and stays easy to update when I push the next tag.
 
@@ -115,7 +115,7 @@ Recommended distribution model:
 1. Push a tag that matches `v*`, for example `vX.Y.Z`.
 2. GitHub Actions builds the wheel and sdist.
 3. GitHub Releases gets the assets automatically.
-4. Install elsewhere with `pipx install git+https://github.com/Mohamad-Kamar/maestro-android.git@vX.Y.Z`.
+4. Install elsewhere with `pipx install git+https://github.com/kalibraring/maestro-android.git@vX.Y.Z`.
 
 Cloud usage:
 
