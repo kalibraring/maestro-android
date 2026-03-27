@@ -14,20 +14,33 @@ pipx ensurepath
 pipx install -e /Users/mkamar/Non_Work/Projects/maestro-android
 ```
 
-After you publish to GitHub:
+For another machine after release:
 
 ```bash
-pipx install git+https://github.com/<your-user>/maestro-android.git
+pipx install git+https://github.com/Mohamad-Kamar/maestro-android.git@v0.1.0
 ```
 
-If you prefer a packaged release:
+If you want a pinned wheel instead of source install:
 
 ```bash
-python3 -m pip install --user build
-cd /Users/mkamar/Non_Work/Projects/maestro-android
-python3 -m build
-pipx install dist/maestro_android-0.1.0-py3-none-any.whl
+pipx install https://github.com/Mohamad-Kamar/maestro-android/releases/download/v0.1.0/maestro_android-0.1.0-py3-none-any.whl
 ```
+
+## Publish Options
+
+Ways to publish this tool:
+
+1. GitHub Releases with tagged wheel/sdist assets.
+2. PyPI with `pipx install maestro-android`.
+3. Install directly from a Git tag with `pipx install git+https://...@vX.Y.Z`.
+4. Internal package index if you later want private distribution.
+
+Simplest and best for this tool right now:
+
+1. GitHub Releases, generated automatically from a tag push.
+2. Install on other machines with `pipx install git+https://github.com/Mohamad-Kamar/maestro-android.git@vX.Y.Z`.
+
+That keeps publishing one-step on my side, needs no manual asset upload, and stays easy to update when I push the next tag.
 
 ## Use
 
@@ -90,15 +103,15 @@ Pocket-GPT’s config is included as a worked example in `examples/pocket-gpt/ma
 
 Recommended distribution model:
 
-1. Put this directory in its own GitHub repo.
-2. Keep the `pipx install git+https://github.com/<user>/maestro-android.git` path working.
-3. Add GitHub Actions to run `python3 -m unittest discover -s tests` and `python3 -m build`.
-4. Attach built wheels to GitHub Releases.
+1. Push a tag that matches `v*`, for example `v0.1.1`.
+2. GitHub Actions builds the wheel and sdist.
+3. GitHub Releases gets the assets automatically.
+4. Install elsewhere with `pipx install git+https://github.com/Mohamad-Kamar/maestro-android.git@v0.1.1`.
 
 Choose and add a real `LICENSE` file before publishing publicly.
 
 That gives you:
 
 - easy install on your own machine with `pipx install -e ...`
-- easy install on other machines from Git
+- easy install on other machines from a tag
 - a clean path to versioned release artifacts later
