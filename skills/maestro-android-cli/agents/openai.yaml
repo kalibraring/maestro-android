@@ -1,7 +1,7 @@
 interface:
   display_name: "Maestro Android CLI"
   short_description: "Run and debug Maestro Android flows"
-  default_prompt: "Use $skill-name to run doctor, lane, scoped, report, and trace for an Android project."
+  default_prompt: "Use $skill-name to run doctor, lane, scoped, report, trace, and cloud workflows for an Android project."
 
 policy:
   allow_implicit_invocation: true
