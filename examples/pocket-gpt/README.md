@@ -5,7 +5,7 @@ This example shows how to aim `maestro-android` at Pocket-GPT without baking Poc
 From the Pocket-GPT repo root:
 
 ```bash
-cp /Users/mkamar/Non_Work/Projects/maestro-android/examples/pocket-gpt/maestro-android.pocket-gpt.yaml .maestro-android.yaml
+cp /path/to/maestro-android/examples/pocket-gpt/maestro-android.pocket-gpt.yaml .maestro-android.yaml
 maestro-android doctor
 maestro-android lane smoke
 maestro-android scoped --flow tmp/maestro-repro.yaml

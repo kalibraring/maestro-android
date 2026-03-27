@@ -11,7 +11,7 @@ For local development on this machine:
 ```bash
 python3 -m pip install --user pipx
 pipx ensurepath
-pipx install -e /Users/mkamar/Non_Work/Projects/maestro-android
+pipx install -e .
 ```
 
 For another machine after release:
