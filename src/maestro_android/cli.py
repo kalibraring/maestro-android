@@ -206,6 +206,25 @@ For full docs, see: https://github.com/kalibraring/maestro-android""",
     )
     clean.add_argument("--include-repo-artifacts", action="store_true")
 
+    lint = subparsers.add_parser(
+        "lint",
+        help="validate Maestro flow YAML files",
+        epilog="Examples:\n  maestro-android lint\n  maestro-android lint tests/maestro/login.yaml\n  maestro-android lint --strict",
+    )
+    lint.add_argument("flows", nargs="*", help="specific flow paths to lint (default: all discovered flows)")
+    lint.add_argument("--strict", action="store_true", help="treat warnings as errors")
+
+    audit_selectors = subparsers.add_parser(
+        "audit-selectors",
+        help="cross-reference Maestro flow selectors with Kotlin testTag definitions",
+        epilog="Examples:\n  maestro-android audit-selectors\n  maestro-android audit-selectors --source-roots apps/mobile-android/src",
+    )
+    audit_selectors.add_argument(
+        "--source-roots",
+        default="",
+        help="comma-separated Kotlin source roots (default: auto-detect)",
+    )
+
     audit_tags = subparsers.add_parser(
         "audit-testtags",
         help="cross-reference Kotlin testTag definitions with Maestro flow usage",
@@ -1200,6 +1219,151 @@ def _run_trace(
         print(f"  {path}")
 
 
+_MAESTRO_COMMANDS = {
+    "launchApp", "stopApp", "clearState", "clearKeychain",
+    "tapOn", "longPressOn", "doubleTapOn", "swipe", "scroll",
+    "scrollUntilVisible", "assertVisible", "assertNotVisible",
+    "inputText", "eraseText", "pressKey", "hideKeyboard",
+    "openLink", "back", "copyTextFrom", "pasteText",
+    "evalScript", "runFlow", "setLocation", "repeat",
+    "waitForAnimationToEnd", "takeScreenshot", "startRecording",
+    "stopRecording", "assertTrue", "extendedWaitUntil",
+    "addMedia", "travel",
+}
+
+
+def _lint_flow(path: Path, strict: bool) -> list[dict[str, str]]:
+    issues: list[dict[str, str]] = []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception as exc:
+        issues.append({"level": "error", "message": f"Cannot read file: {exc}"})
+        return issues
+
+    if not text.strip():
+        issues.append({"level": "error", "message": "File is empty"})
+        return issues
+
+    if yaml is None:
+        issues.append({"level": "error", "message": "PyYAML not installed"})
+        return issues
+
+    try:
+        documents = list(yaml.safe_load_all(text))
+    except Exception as exc:
+        issues.append({"level": "error", "message": f"YAML parse error: {exc}"})
+        return issues
+
+    document: Any = None
+    for doc in documents:
+        if doc is None:
+            continue
+        if document is None:
+            document = doc
+        elif isinstance(document, dict) and isinstance(doc, (list, dict)):
+            if isinstance(doc, list):
+                document["steps"] = doc
+            else:
+                document.update(doc)
+
+    if document is None:
+        issues.append({"level": "error", "message": "YAML parsed to null / empty"})
+        return issues
+
+    if isinstance(document, dict):
+        app_id = document.get("appId")
+        if not app_id:
+            issues.append({"level": "warning", "message": "Missing 'appId' — flow may fail on device"})
+        steps = document.get("steps") or document.get("commands") or []
+        if not steps and not document.get("env"):
+            has_commands = any(
+                key in _MAESTRO_COMMANDS or key.startswith("-") for key in document.keys()
+            )
+            if not has_commands:
+                issues.append({"level": "warning", "message": "No steps/commands found in flow"})
+    elif isinstance(document, list):
+        steps = document
+    else:
+        issues.append({"level": "error", "message": f"Unexpected YAML root type: {type(document).__name__}"})
+        return issues
+
+    if isinstance(document, dict):
+        steps_to_check: list[Any] = []
+        for key, value in document.items():
+            if key.startswith("-") or key in _MAESTRO_COMMANDS:
+                steps_to_check.append({key: value})
+            elif key == "steps" and isinstance(value, list):
+                steps_to_check.extend(value)
+        for step in steps_to_check:
+            if isinstance(step, dict):
+                for command_name in step:
+                    cleaned = command_name.lstrip("- ")
+                    if cleaned and cleaned not in _MAESTRO_COMMANDS and cleaned not in {
+                        "appId", "name", "tags", "env", "onFlowStart", "onFlowComplete",
+                        "onFlowError", "steps", "commands",
+                    }:
+                        issues.append({
+                            "level": "warning",
+                            "message": f"Unknown command '{cleaned}' (may be valid in newer Maestro)",
+                        })
+
+    lines = text.splitlines()
+    if lines:
+        first = lines[0].strip()
+        if not first.startswith("#") and not first.startswith("appId") and not first.startswith("---"):
+            if strict:
+                issues.append({"level": "warning", "message": "First line is not a comment or appId declaration"})
+
+    return issues
+
+
+def _run_lint(
+    parsed: argparse.Namespace, config: MaestroAndroidConfig, project_root: Path
+) -> int:
+    if yaml is None:
+        raise MaestroAndroidError(
+            "ENVIRONMENT_ERROR", "PyYAML is required. Run: python3 -m pip install PyYAML"
+        )
+    strict = parsed.strict
+    if parsed.flows:
+        flow_paths = [
+            (project_root / f).resolve() if not Path(f).is_absolute() else Path(f).resolve()
+            for f in parsed.flows
+        ]
+        for p in flow_paths:
+            if not p.exists():
+                raise MaestroAndroidError("CONFIG_ERROR", f"Flow does not exist: {p}")
+    else:
+        flow_paths = _discover_all_flow_paths(project_root, config)
+    if not flow_paths:
+        print_step("No flows found to lint.")
+        return 0
+
+    total_errors = 0
+    total_warnings = 0
+    for path in flow_paths:
+        issues = _lint_flow(path, strict)
+        rel = _relativize(path, project_root)
+        errors = [i for i in issues if i["level"] == "error"]
+        warnings = [i for i in issues if i["level"] == "warning"]
+        total_errors += len(errors)
+        total_warnings += len(warnings)
+        if not issues:
+            print(f"  ok     {rel}")
+            continue
+        for issue in issues:
+            tag = "ERROR" if issue["level"] == "error" else "WARN "
+            print(f"  {tag}  {rel}: {issue['message']}")
+
+    print()
+    effective_errors = total_errors + (total_warnings if strict else 0)
+    print_step(
+        f"Lint: {len(flow_paths)} flows, {total_errors} errors, {total_warnings} warnings"
+        + (" (strict: warnings are errors)" if strict else "")
+    )
+    return 1 if effective_errors > 0 else 0
+
+
 _TEST_TAG_PATTERN = re.compile(r'\.testTag\(\s*"([^"]+)"\s*\)')
 _FLOW_ID_PATTERN = re.compile(r'\bid:\s*["\']?([^\s"\',}]+)')
 
@@ -1275,6 +1439,58 @@ def _run_audit_testtags(
         f"{len(missing)} missing (in flows but not code)"
     )
     return 1 if missing else 0
+
+
+def _resolve_source_roots(
+    explicit: str, project_root: Path
+) -> list[Path]:
+    if explicit:
+        return [project_root / r for r in _parse_csv(explicit)]
+    candidates = ["app/src", "apps", "src/main", "src"]
+    return [project_root / c for c in candidates if (project_root / c).exists()]
+
+
+def _run_audit_selectors(
+    parsed: argparse.Namespace, config: MaestroAndroidConfig, project_root: Path
+) -> int:
+    source_roots = _resolve_source_roots(
+        getattr(parsed, "source_roots", ""), project_root
+    )
+    if not source_roots:
+        print_step("No Kotlin source roots found.")
+        return 1
+
+    kotlin_tags = _scan_kotlin_test_tags(source_roots)
+    flow_paths = _discover_all_flow_paths(project_root, config)
+    flow_ids = _scan_flow_ids(flow_paths)
+
+    dangling: list[tuple[str, list[str]]] = []
+    covered: list[str] = []
+
+    for selector, flow_files in sorted(flow_ids.items()):
+        if selector in kotlin_tags:
+            covered.append(selector)
+        else:
+            dangling.append((selector, flow_files))
+
+    print(f"  {'Selector':<45} {'Flows':<6} {'Kotlin':<8} {'Status'}")
+    print(f"  {'-' * 45} {'-' * 6} {'-' * 8} {'-' * 10}")
+    for selector in covered:
+        in_flows = len(flow_ids[selector])
+        in_kotlin = len(kotlin_tags[selector])
+        print(f"  {selector:<45} {in_flows:<6} {in_kotlin:<8} ok")
+    for selector, flow_files in dangling:
+        in_flows = len(flow_files)
+        print(f"  {selector:<45} {in_flows:<6} {'0':<8} dangling")
+
+    print()
+    print_step(
+        f"Selector audit: {len(covered)} covered, {len(dangling)} dangling "
+        f"(used in flows but no matching testTag in code)"
+    )
+    if dangling:
+        print_step("Hint: dangling selectors will cause 'No view found' failures at runtime.")
+    return 1 if dangling else 0
 
 
 def _merge_junit(inputs: list[Path], output_path: Path) -> None:
@@ -1657,6 +1873,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if parsed.command == "clean":
             _run_clean(parsed, config)
             return 0
+        if parsed.command == "lint":
+            return _run_lint(parsed, config, project_root)
+        if parsed.command == "audit-selectors":
+            return _run_audit_selectors(parsed, config, project_root)
         if parsed.command == "audit-testtags":
             return _run_audit_testtags(parsed, config, project_root)
         if parsed.command == "cloud":
