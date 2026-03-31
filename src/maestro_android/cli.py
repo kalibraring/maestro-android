@@ -6,7 +6,7 @@ import os
 import re
 import shutil
 import subprocess
-import time
+import time as _time
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from importlib.metadata import version
@@ -42,7 +42,7 @@ def _build_parser() -> argparse.ArgumentParser:
   maestro-android report latest                   # View latest test artifacts
   maestro-android cloud smoke                     # Run hosted smoke suite
   
-For full docs, see: https://github.com/kalibraring/maestro-android""",
+For full docs, see: https://github.com/Mohamad-Kamar/maestro-android""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -131,6 +131,37 @@ For full docs, see: https://github.com/kalibraring/maestro-android""",
     scoped.add_argument("--pattern", default="", help="override crash signature regex")
     scoped.add_argument("--app-context", default="", help="override app context regex")
     scoped.add_argument(
+        "--type",
+        choices=("maestro", "instrumented", "unit"),
+        default="maestro",
+        dest="scoped_type",
+        help="test type: maestro flow, instrumented (connectedAndroidTest), or unit test",
+    )
+    scoped.add_argument(
+        "--test-class",
+        default="",
+        help="fully qualified test class for instrumented/unit runs",
+    )
+    scoped.add_argument(
+        "--gradle-property",
+        action="append",
+        default=[],
+        dest="gradle_properties",
+        help="extra -P property for the build command (repeatable, e.g. --gradle-property key=value)",
+    )
+    scoped.add_argument(
+        "--adb-timeout-sec",
+        type=int,
+        default=120,
+        help="adb timeout in seconds",
+    )
+    scoped.add_argument(
+        "--maestro-timeout-sec",
+        type=int,
+        default=1200,
+        help="maestro timeout in seconds",
+    )
+    scoped.add_argument(
         "extra_args", nargs=argparse.REMAINDER, help="extra args after --"
     )
 
@@ -174,6 +205,17 @@ For full docs, see: https://github.com/kalibraring/maestro-android""",
         epilog="Examples:\n  maestro-android clean\n  maestro-android clean --include-repo-artifacts",
     )
     clean.add_argument("--include-repo-artifacts", action="store_true")
+
+    audit_tags = subparsers.add_parser(
+        "audit-testtags",
+        help="cross-reference Kotlin testTag definitions with Maestro flow usage",
+        epilog="Example: maestro-android audit-testtags",
+    )
+    audit_tags.add_argument(
+        "--source-roots",
+        default="",
+        help="comma-separated Kotlin source roots (default: auto-detect)",
+    )
 
     cloud = subparsers.add_parser(
         "cloud",
@@ -232,6 +274,17 @@ For full docs, see: https://github.com/kalibraring/maestro-android""",
     cloud_status.add_argument("--interval", type=int, default=60)
     cloud_status.add_argument("uploads", nargs="+", help="label:upload-id entries")
 
+    suggest = subparsers.add_parser(
+        "suggest",
+        help="suggest which lanes to run based on changed files",
+        epilog="Examples:\n  maestro-android suggest\n  maestro-android suggest --diff HEAD~3",
+    )
+    suggest.add_argument(
+        "--diff",
+        default="HEAD",
+        help="git diff target (default: HEAD for uncommitted changes)",
+    )
+
     return parser
 
 
@@ -286,19 +339,40 @@ def _resolve_serial(explicit: str) -> str:
     env_serial = os.environ.get("ADB_SERIAL") or os.environ.get("ANDROID_SERIAL")
     if env_serial:
         return env_serial
-    completed = run_subprocess(["adb", "devices"], capture_output=True, check=False)
-    devices = [
-        line.split()[0]
-        for line in (completed.stdout or "").splitlines()[1:]
-        if "\tdevice" in line
-    ]
+    completed = run_subprocess(["adb", "devices", "-l"], capture_output=True, check=False)
+    devices: list[dict[str, str]] = []
+    for line in (completed.stdout or "").splitlines()[1:]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parts = stripped.split()
+        if len(parts) < 2 or parts[1] != "device":
+            continue
+        serial = parts[0]
+        details = " ".join(parts[2:])
+        model = ""
+        for token in parts[2:]:
+            if token.startswith("model:"):
+                model = token.split(":", 1)[1]
+                break
+        devices.append({"serial": serial, "details": details, "model": model})
     if not devices:
         raise MaestroAndroidError("DEVICE_ERROR", "No connected adb device detected.")
     if len(devices) > 1:
+        models = [d["model"] for d in devices if d["model"]]
+        unique_models = set(models)
+        if len(unique_models) == 1 and len(models) == len(devices):
+            print_step(
+                f"Warning: {len(devices)} transports detected for the same device "
+                f"(model={models[0]}). Using first: {devices[0]['serial']}"
+            )
+            return devices[0]["serial"]
         raise MaestroAndroidError(
-            "DEVICE_ERROR", "Multiple adb devices detected; pass --device."
+            "DEVICE_ERROR",
+            f"Multiple adb devices detected ({len(devices)}); pass --device. "
+            + ", ".join(f"{d['serial']} ({d['details']})" for d in devices),
         )
-    return devices[0]
+    return devices[0]["serial"]
 
 
 def _cloud_project_id(
@@ -528,6 +602,12 @@ def _discover_flow_paths(
     return paths
 
 
+def _discover_all_flow_paths(
+    project_root: Path, config: MaestroAndroidConfig
+) -> list[Path]:
+    return _discover_flow_paths(project_root, config)
+
+
 def _select_flows(
     project_root: Path,
     config: MaestroAndroidConfig,
@@ -574,10 +654,15 @@ def _select_flows(
     return selected
 
 
-def _capture_logcat(serial: str, output_path: Path) -> None:
+def _capture_logcat(
+    serial: str, output_path: Path, timeout_seconds: float | None = None
+) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     completed = run_subprocess(
-        ["adb", "-s", serial, "logcat", "-d"], capture_output=True, check=False
+        ["adb", "-s", serial, "logcat", "-d"],
+        capture_output=True,
+        check=False,
+        timeout_seconds=timeout_seconds,
     )
     output_path.write_text(completed.stdout or "", encoding="utf-8")
 
@@ -613,6 +698,55 @@ def _relativize(path: Path, project_root: Path) -> str:
         return str(path)
 
 
+_FAILURE_HINTS: list[tuple[str, str]] = [
+    (r"FATAL EXCEPTION.*NullPointerException", "App crashed with NullPointerException. Check the stack trace in logcat.txt."),
+    (r"FATAL EXCEPTION", "App crashed with a fatal exception. Check logcat.txt for the full stack trace."),
+    (r"Fatal signal|SIGSEGV", "Native crash detected (SIGSEGV/signal). Check logcat.txt for the native backtrace."),
+    (r"ANR in", "Application Not Responding. The app froze. Check logcat.txt for ANR details."),
+    (r"Timeout.*waiting for|timed out", "Maestro timed out waiting for a UI element. The selector may be wrong or the app is slow to render."),
+    (r"No views? found|Could not find", "Maestro could not find the target UI element. Run `maestro-android audit-selectors` to check selector health."),
+    (r"Unable to launch app|app.*not installed", "The app could not be launched. Verify it is installed with `adb shell pm list packages`."),
+    (r"OutOfMemoryError", "The app ran out of memory. Consider reducing model size or checking for memory leaks."),
+]
+
+
+def _diagnose_failure(flow_result: dict[str, Any], artifact_root: Path) -> None:
+    texts_to_scan: list[str] = []
+    for key in ("logcat", "stderr"):
+        rel = flow_result.get(key)
+        if not rel:
+            continue
+        path = artifact_root / rel
+        if path.exists():
+            texts_to_scan.append(path.read_text(encoding="utf-8", errors="replace"))
+    combined = "\n".join(texts_to_scan)
+    for pattern, hint in _FAILURE_HINTS:
+        if re.search(pattern, combined, re.IGNORECASE):
+            print_step(f"Hint: {hint}")
+            return
+    print_step("Hint: Check maestro-stderr.log and logcat.txt in the artifact directory for details.")
+
+
+def _print_run_summary(flow_results: list[dict[str, Any]]) -> None:
+    passed = sum(1 for f in flow_results if f["status"] == "passed")
+    failed = sum(1 for f in flow_results if f["status"] != "passed")
+    total = len(flow_results)
+    print()
+    print(f"  {'Flow':<55} {'Status':<10} {'Duration'}")
+    print(f"  {'-' * 55} {'-' * 10} {'-' * 10}")
+    for flow in flow_results:
+        name = flow["flow"]
+        if len(name) > 54:
+            name = "..." + name[-51:]
+        duration = f"{flow.get('duration_s', 0)}s"
+        status = flow["status"].upper()
+        print(f"  {name:<55} {status:<10} {duration}")
+    print()
+    slowest = max(flow_results, key=lambda f: f.get("duration_s", 0)) if flow_results else None
+    slowest_note = f", slowest: {slowest['flow']} ({slowest.get('duration_s', 0)}s)" if slowest and total > 1 else ""
+    print_step(f"Result: {passed} passed, {failed} failed of {total}{slowest_note}")
+
+
 def _run_maestro_flow(
     *,
     project_root: Path,
@@ -623,16 +757,24 @@ def _run_maestro_flow(
     output_format: str,
     artifact_root: Path,
     extra_args: Sequence[str] = (),
+    adb_timeout_sec: float | None = None,
+    maestro_timeout_sec: float | None = None,
 ) -> dict[str, Any]:
     flow_dir = artifact_root / "flows" / flow.stem
     debug_dir = flow_dir / "maestro-debug"
     debug_dir.mkdir(parents=True, exist_ok=True)
-    run_subprocess(["adb", "-s", serial, "logcat", "-c"], check=False, cwd=project_root)
+    run_subprocess(
+        ["adb", "-s", serial, "logcat", "-c"],
+        check=False,
+        cwd=project_root,
+        timeout_seconds=adb_timeout_sec,
+    )
     if clear_state and app_id:
         run_subprocess(
             ["adb", "-s", serial, "shell", "pm", "clear", app_id],
             check=False,
             cwd=project_root,
+            timeout_seconds=adb_timeout_sec,
         )
     command = [
         "maestro",
@@ -646,9 +788,16 @@ def _run_maestro_flow(
         output_format,
         *extra_args,
     ]
+    started_at = _time.time()
     completed = run_subprocess(
-        command, capture_output=True, check=False, cwd=project_root
+        command,
+        capture_output=True,
+        check=False,
+        cwd=project_root,
+        timeout_seconds=maestro_timeout_sec,
     )
+    finished_at = _time.time()
+    duration_s = round(finished_at - started_at, 1)
 
     junit_path = flow_dir / "junit.xml"
     stderr_path = flow_dir / "maestro-stderr.log"
@@ -659,11 +808,14 @@ def _run_maestro_flow(
         stdout_path.write_text(completed.stdout or "", encoding="utf-8")
     stderr_path.write_text(completed.stderr or "", encoding="utf-8")
     logcat_path = flow_dir / "logcat.txt"
-    _capture_logcat(serial, logcat_path)
+    _capture_logcat(serial, logcat_path, timeout_seconds=adb_timeout_sec)
 
     return {
         "flow": _relativize(flow, project_root),
         "status": "passed" if completed.returncode == 0 else "failed",
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "duration_s": duration_s,
         "returncode": completed.returncode,
         "junit": str(junit_path.relative_to(artifact_root))
         if junit_path.exists()
@@ -714,6 +866,10 @@ def _execute_test_run(
             )
         )
 
+    for flow_result in flow_results:
+        if flow_result["status"] != "passed":
+            _diagnose_failure(flow_result, artifact_root)
+
     manifest = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "device": serial,
@@ -723,6 +879,7 @@ def _execute_test_run(
     }
     _write_json(artifact_root / "run-manifest.json", manifest)
     _write_trace(artifact_root / "trace.json", manifest)
+    _print_run_summary(flow_results)
     print_step(f"Maestro test artifacts: {artifact_root}")
     return artifact_root
 
@@ -867,6 +1024,64 @@ def _scan_logcat(
     return matches
 
 
+def _run_scoped_gradle(
+    parsed: argparse.Namespace,
+    config: MaestroAndroidConfig,
+    project_root: Path,
+    serial: str,
+    artifact_root: Path,
+) -> int:
+    run_subprocess(
+        ["adb", "-s", serial, "logcat", "-c"],
+        check=False,
+        cwd=project_root,
+        timeout_seconds=float(parsed.adb_timeout_sec),
+    )
+    if parsed.scoped_type == "unit":
+        task = "testDebugUnitTest"
+    else:
+        task = "connectedDebugAndroidTest"
+    command = ["./gradlew", task]
+    if parsed.test_class:
+        command.append(f"--tests={parsed.test_class}")
+    env_override = {**os.environ, "ANDROID_SERIAL": serial}
+    completed = run_subprocess(
+        command, capture_output=True, check=False, cwd=project_root,
+        env=env_override,
+    )
+    stdout_path = artifact_root / "gradle-stdout.log"
+    stderr_path = artifact_root / "gradle-stderr.log"
+    stdout_path.write_text(completed.stdout or "", encoding="utf-8")
+    stderr_path.write_text(completed.stderr or "", encoding="utf-8")
+    logcat_path = artifact_root / "logcat.txt"
+    _capture_logcat(serial, logcat_path, timeout_seconds=float(parsed.adb_timeout_sec))
+
+    status = "passed" if completed.returncode == 0 else "failed"
+    manifest = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "device": serial,
+        "label": f"scoped-{parsed.scoped_type}",
+        "type": parsed.scoped_type,
+        "test_class": parsed.test_class or None,
+        "flows": [{
+            "flow": parsed.test_class or task,
+            "status": status,
+            "returncode": completed.returncode,
+            "logcat": "logcat.txt",
+            "stderr": "gradle-stderr.log",
+        }],
+    }
+    _write_json(artifact_root / "run-manifest.json", manifest)
+    print_step(f"Scoped {parsed.scoped_type} artifacts: {artifact_root}")
+    if status != "passed":
+        raise MaestroAndroidError(
+            "DEVICE_ERROR",
+            f"Scoped {parsed.scoped_type} run failed (exit {completed.returncode}). "
+            f"See {stderr_path}",
+        )
+    return 0
+
+
 def _run_scoped(
     parsed: argparse.Namespace, config: MaestroAndroidConfig, project_root: Path
 ) -> int:
@@ -883,9 +1098,15 @@ def _run_scoped(
     artifact_root.mkdir(parents=True, exist_ok=True)
 
     if not parsed.no_build:
-        run_subprocess(config.project.build_command, cwd=project_root)
+        build_cmd = list(config.project.build_command)
+        for prop in parsed.gradle_properties:
+            build_cmd.append(f"-P{prop}")
+        run_subprocess(build_cmd, cwd=project_root)
     if not parsed.no_install:
         run_subprocess(config.project.install_command, cwd=project_root)
+
+    if parsed.scoped_type != "maestro":
+        return _run_scoped_gradle(parsed, config, project_root, serial, artifact_root)
 
     extra_args = list(parsed.extra_args)
     if extra_args and extra_args[0] == "--":
@@ -899,6 +1120,8 @@ def _run_scoped(
         output_format="junit",
         artifact_root=artifact_root,
         extra_args=extra_args,
+        adb_timeout_sec=float(parsed.adb_timeout_sec),
+        maestro_timeout_sec=float(parsed.maestro_timeout_sec),
     )
     manifest = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -975,6 +1198,83 @@ def _run_trace(
     )
     for path in debug_dirs:
         print(f"  {path}")
+
+
+_TEST_TAG_PATTERN = re.compile(r'\.testTag\(\s*"([^"]+)"\s*\)')
+_FLOW_ID_PATTERN = re.compile(r'\bid:\s*["\']?([^\s"\',}]+)')
+
+
+def _scan_kotlin_test_tags(source_roots: list[Path]) -> dict[str, list[str]]:
+    tags: dict[str, list[str]] = {}
+    for root in source_roots:
+        if not root.exists():
+            continue
+        for kt_file in sorted(root.rglob("*.kt")):
+            text = kt_file.read_text(encoding="utf-8", errors="replace")
+            for match in _TEST_TAG_PATTERN.finditer(text):
+                tag = match.group(1)
+                if tag not in tags:
+                    tags[tag] = []
+                tags[tag].append(str(kt_file))
+    return tags
+
+
+def _scan_flow_ids(flow_paths: list[Path]) -> dict[str, list[str]]:
+    ids: dict[str, list[str]] = {}
+    for path in flow_paths:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for match in _FLOW_ID_PATTERN.finditer(text):
+            tag = match.group(1)
+            if tag not in ids:
+                ids[tag] = []
+            ids[tag].append(str(path))
+    return ids
+
+
+def _run_audit_testtags(
+    parsed: argparse.Namespace, config: MaestroAndroidConfig, project_root: Path
+) -> int:
+    explicit_roots = _parse_csv(getattr(parsed, "source_roots", ""))
+    if explicit_roots:
+        source_roots = [project_root / r for r in explicit_roots]
+    else:
+        candidates = ["app/src", "apps", "src/main", "src"]
+        source_roots = [project_root / c for c in candidates if (project_root / c).exists()]
+    if not source_roots:
+        print_step("No Kotlin source roots found.")
+        return 1
+
+    kotlin_tags = _scan_kotlin_test_tags(source_roots)
+    flow_paths = _discover_all_flow_paths(project_root, config)
+    flow_ids = _scan_flow_ids(flow_paths)
+
+    all_tags = sorted(set(kotlin_tags.keys()) | set(flow_ids.keys()))
+    orphaned = []
+    missing = []
+    matched = []
+
+    print(f"  {'testTag':<45} {'Kotlin':<8} {'Flows':<8} {'Status'}")
+    print(f"  {'-' * 45} {'-' * 8} {'-' * 8} {'-' * 10}")
+    for tag in all_tags:
+        in_kotlin = len(kotlin_tags.get(tag, []))
+        in_flows = len(flow_ids.get(tag, []))
+        if in_kotlin > 0 and in_flows > 0:
+            status = "ok"
+            matched.append(tag)
+        elif in_kotlin > 0:
+            status = "orphaned"
+            orphaned.append(tag)
+        else:
+            status = "missing"
+            missing.append(tag)
+        print(f"  {tag:<45} {in_kotlin:<8} {in_flows:<8} {status}")
+
+    print()
+    print_step(
+        f"testTag audit: {len(matched)} matched, {len(orphaned)} orphaned (in code but not flows), "
+        f"{len(missing)} missing (in flows but not code)"
+    )
+    return 1 if missing else 0
 
 
 def _merge_junit(inputs: list[Path], output_path: Path) -> None:
@@ -1107,7 +1407,7 @@ def _run_cloud_status_command(
         if poll_once():
             return 0
         print()
-        time.sleep(interval)
+        _time.sleep(interval)
 
 
 def _run_cloud(
@@ -1267,6 +1567,59 @@ def _run_start_device(parsed: argparse.Namespace) -> None:
     run_subprocess(["adb", "wait-for-device"], timeout_seconds=timeout)
 
 
+def _run_suggest(
+    parsed: argparse.Namespace, config: MaestroAndroidConfig, project_root: Path
+) -> int:
+    completed = run_subprocess(
+        ["git", "diff", "--name-only", parsed.diff],
+        capture_output=True, check=False, cwd=project_root,
+    )
+    if completed.returncode != 0:
+        completed = run_subprocess(
+            ["git", "diff", "--name-only", "--cached"],
+            capture_output=True, check=False, cwd=project_root,
+        )
+    changed = [f.strip() for f in (completed.stdout or "").splitlines() if f.strip()]
+    if not changed:
+        print_step("No changed files detected.")
+        return 0
+
+    has_kotlin = any(f.endswith(".kt") for f in changed)
+    has_native = any(f.endswith((".cpp", ".c", ".h", ".hpp")) or "/cpp/" in f or "/jni/" in f for f in changed)
+    has_compose_ui = any("ui/" in f and f.endswith(".kt") for f in changed)
+    has_test_flows = any(f.endswith((".yaml", ".yml")) and ("maestro" in f or "tests/" in f) for f in changed)
+    has_strings = any("strings.xml" in f for f in changed)
+    has_gradle = any(f.endswith((".gradle", ".gradle.kts")) or f == "gradle.properties" for f in changed)
+
+    suggestions: list[str] = []
+
+    if has_kotlin or has_gradle:
+        suggestions.append("./gradlew testDebugUnitTest              # compile + unit tests")
+    if has_compose_ui or has_strings:
+        suggestions.append("maestro-android lane smoke               # UI smoke after composable/string changes")
+    if has_native:
+        suggestions.append("./gradlew connectedDebugAndroidTest      # native bridge validation")
+    if has_test_flows:
+        suggestions.append("maestro-android lint                     # validate flow health after flow edits")
+        suggestions.append("maestro-android audit-selectors          # check selector coverage")
+    if has_kotlin and not has_native:
+        suggestions.append("maestro-android suggest                  # broader pre-merge analysis")
+
+    if not suggestions:
+        suggestions.append("./gradlew testDebugUnitTest              # default: compile + unit tests")
+
+    print_step(f"Changed files: {len(changed)}")
+    for f in changed[:15]:
+        print(f"  {f}")
+    if len(changed) > 15:
+        print(f"  ... and {len(changed) - 15} more")
+    print()
+    print_step("Suggested commands:")
+    for s in suggestions:
+        print(f"  {s}")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     parsed = parser.parse_args(list(argv) if argv is not None else None)
@@ -1304,8 +1657,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if parsed.command == "clean":
             _run_clean(parsed, config)
             return 0
+        if parsed.command == "audit-testtags":
+            return _run_audit_testtags(parsed, config, project_root)
         if parsed.command == "cloud":
             return _run_cloud(parsed, config, project_root)
+        if parsed.command == "suggest":
+            return _run_suggest(parsed, config, project_root)
         raise MaestroAndroidError("CONFIG_ERROR", f"Unknown command '{parsed.command}'")
     except MaestroAndroidError as exc:
         print(f"{exc.code}: {exc.message}")
