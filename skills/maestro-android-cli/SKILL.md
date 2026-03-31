@@ -19,7 +19,7 @@ Reproducible device selection (auto-detects serial, warns on duplicate transport
 | Maestro flow YAML | `maestro-android lint` + `maestro-android audit-selectors` | Flow health |
 | Pre-merge (any change) | Full test suite + `maestro-android lane smoke` | Broad confidence |
 | Debugging specific failure | `maestro-android scoped --flow tmp/repro.yaml` | Fast one-flow repro |
-| Debugging instrumented test | `maestro-android scoped --type instrumented --test-class com.example.Test` | Gradle test with artifacts |
+| Debugging instrumented test | `maestro-android scoped --flow tmp/repro.yaml --type instrumented --test-class com.example.Test` | Gradle test with artifacts |
 | Not sure what to run | `maestro-android suggest` | Auto-suggest based on git diff |
 
 ## Setup
@@ -35,11 +35,11 @@ maestro-android doctor
 - `doctor` -- verify adb, maestro, gradlew, config
 - `lane <name>` -- run configured lanes
 - `scoped --flow tmp/repro.yaml` -- one-flow repro with crash scanning
-- `scoped --type instrumented|unit` -- Gradle test with structured artifacts
+- `scoped --flow tmp/repro.yaml --type instrumented|unit` -- Gradle test with structured artifacts
 - `suggest` -- recommend lanes based on `git diff`
 - `lint` / `audit-selectors` / `audit-testtags` -- flow and selector health
 - `report latest` / `trace latest` -- inspect artifacts
-- `clean --stale-flows --confirm` -- prune old tmp flows
+- `clean [--include-repo-artifacts]` -- remove scratch artifacts
 - `cloud smoke|benchmark|status` -- hosted workflows
 
 ## Feedback Loop
