@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import time as _time
 import xml.etree.ElementTree as ET
+from contextlib import suppress
 from datetime import datetime
 from importlib.metadata import version
 from pathlib import Path
@@ -67,6 +68,11 @@ For full docs, see: https://github.com/kalibraring/maestro-android""",
     doctor.add_argument(
         "--json", action="store_true", dest="as_json", help="emit JSON when supported"
     )
+    doctor.add_argument(
+        "--include-generated-flows",
+        action="store_true",
+        help="include generated/prepared flow files in flow inventory output",
+    )
 
     init = subparsers.add_parser(
         "init",
@@ -81,8 +87,13 @@ For full docs, see: https://github.com/kalibraring/maestro-android""",
     )
     init.add_argument("--force", action="store_true", help="overwrite existing file")
 
-    subparsers.add_parser(
-        "devices", help="list adb devices", epilog="Example: maestro-android devices"
+    devices = subparsers.add_parser(
+        "devices",
+        help="list adb devices with transport details",
+        epilog="Examples:\n  maestro-android devices\n  maestro-android devices --json",
+    )
+    devices.add_argument(
+        "--json", action="store_true", dest="as_json", help="emit JSON when supported"
     )
 
     start_device = subparsers.add_parser(
@@ -116,6 +127,7 @@ For full docs, see: https://github.com/kalibraring/maestro-android""",
         epilog="Examples:\n  maestro-android lane smoke\n  maestro-android lane smoke -- --verbose\n  maestro-android lane my-custom-lane",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    lane.add_argument("--device", default="", help="device serial")
     lane.add_argument("name", help="lane name")
     lane.add_argument("args", nargs=argparse.REMAINDER, help="extra lane args")
 
@@ -124,7 +136,11 @@ For full docs, see: https://github.com/kalibraring/maestro-android""",
         help="run the scoped repro loop",
         epilog="Examples:\n  maestro-android scoped --flow tmp/repro.yaml\n  maestro-android scoped --flow tmp/repro.yaml --pattern 'NullPointerException'\n  maestro-android scoped --flow tmp/repro.yaml --no-build",
     )
-    scoped.add_argument("--flow", required=True, help="tmp flow path")
+    scoped.add_argument(
+        "--flow",
+        default="",
+        help="tmp flow path (required for --type maestro)",
+    )
     scoped.add_argument("--device", default="", help="device serial")
     scoped.add_argument("--no-build", action="store_true")
     scoped.add_argument("--no-install", action="store_true")
@@ -140,7 +156,14 @@ For full docs, see: https://github.com/kalibraring/maestro-android""",
     scoped.add_argument(
         "--test-class",
         default="",
-        help="fully qualified test class for instrumented/unit runs",
+        help="test selector. Use Class or Class#method for instrumented runs; becomes --tests for unit runs",
+    )
+    scoped.add_argument(
+        "--runner-arg",
+        action="append",
+        default=[],
+        dest="runner_args",
+        help="extra Android instrumentation runner arg for --type instrumented (repeatable, key=value)",
     )
     scoped.add_argument(
         "--gradle-property",
@@ -202,9 +225,30 @@ For full docs, see: https://github.com/kalibraring/maestro-android""",
     clean = subparsers.add_parser(
         "clean",
         help="remove maestro-android scratch artifacts",
-        epilog="Examples:\n  maestro-android clean\n  maestro-android clean --include-repo-artifacts",
+        epilog="Examples:\n  maestro-android clean\n  maestro-android clean --include-repo-artifacts\n  maestro-android clean --stale-flows\n  maestro-android clean --stale-flows --confirm",
     )
     clean.add_argument("--include-repo-artifacts", action="store_true")
+    clean.add_argument(
+        "--generated-flows",
+        action="store_true",
+        help="also remove generated/prepared Maestro flow files under configured flow roots",
+    )
+    clean.add_argument(
+        "--stale-flows",
+        action="store_true",
+        help="list or remove generated prepared-flow YAML files",
+    )
+    clean.add_argument(
+        "--confirm",
+        action="store_true",
+        help="required to actually delete files selected by --stale-flows",
+    )
+    clean.add_argument(
+        "--days",
+        type=int,
+        default=0,
+        help="only match generated flow files older than this many days",
+    )
 
     lint = subparsers.add_parser(
         "lint",
@@ -213,6 +257,11 @@ For full docs, see: https://github.com/kalibraring/maestro-android""",
     )
     lint.add_argument("flows", nargs="*", help="specific flow paths to lint (default: all discovered flows)")
     lint.add_argument("--strict", action="store_true", help="treat warnings as errors")
+    lint.add_argument(
+        "--include-generated-flows",
+        action="store_true",
+        help="lint generated/prepared flow files as well",
+    )
 
     audit_selectors = subparsers.add_parser(
         "audit-selectors",
@@ -224,6 +273,11 @@ For full docs, see: https://github.com/kalibraring/maestro-android""",
         default="",
         help="comma-separated Kotlin source roots (default: auto-detect)",
     )
+    audit_selectors.add_argument(
+        "--include-generated-flows",
+        action="store_true",
+        help="include generated/prepared flow files in selector usage",
+    )
 
     audit_tags = subparsers.add_parser(
         "audit-testtags",
@@ -234,6 +288,11 @@ For full docs, see: https://github.com/kalibraring/maestro-android""",
         "--source-roots",
         default="",
         help="comma-separated Kotlin source roots (default: auto-detect)",
+    )
+    audit_tags.add_argument(
+        "--include-generated-flows",
+        action="store_true",
+        help="include generated/prepared flow files in flow usage",
     )
 
     cloud = subparsers.add_parser(
@@ -247,6 +306,48 @@ For full docs, see: https://github.com/kalibraring/maestro-android""",
     cloud_run.add_argument(
         "args", nargs=argparse.REMAINDER, help="arguments for maestro cloud"
     )
+
+    cloud_probe = cloud_subparsers.add_parser(
+        "probe",
+        help="run a single hosted flow or tag slice for targeted diagnosis",
+        epilog=(
+            "Examples:\n"
+            "  maestro-android cloud probe --flow tests/maestro-cloud/scenario-runtime-ready-smoke.yaml\n"
+            "  maestro-android cloud probe --tags runtime-readiness\n"
+            "  maestro-android cloud probe --flow tests/maestro-cloud/scenario-runtime-ready-smoke.yaml --run-root tmp/runtime-probe"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    cloud_probe.add_argument("--api-level", type=int, default=34)
+    cloud_probe.add_argument("--no-build", action="store_true")
+    cloud_probe.add_argument(
+        "--project-id", default="", help="override Maestro Cloud project id"
+    )
+    cloud_probe.add_argument(
+        "--device-locale", default="", help="override device locale"
+    )
+    cloud_probe.add_argument(
+        "--flow",
+        default="",
+        help="explicit hosted flow file path relative to project root",
+    )
+    cloud_probe.add_argument(
+        "--flows-root",
+        default="",
+        help="override hosted flows root when probing by tags",
+    )
+    cloud_probe.add_argument(
+        "--tags",
+        default="",
+        help="comma-separated include-tags for the probe",
+    )
+    cloud_probe.add_argument(
+        "--run-root",
+        default="",
+        help="write artifacts under a specific directory",
+    )
+    cloud_probe.add_argument("--watch", action="store_true")
+    cloud_probe.add_argument("--interval", type=int, default=60)
 
     cloud_smoke = cloud_subparsers.add_parser(
         "smoke", help="run the hosted cloud-smoke suite"
@@ -265,6 +366,8 @@ For full docs, see: https://github.com/kalibraring/maestro-android""",
         "--flows-root", default="", help="override hosted smoke flows root"
     )
     cloud_smoke.add_argument("--tags", default="", help="override tag filter")
+    cloud_smoke.add_argument("--watch", action="store_true")
+    cloud_smoke.add_argument("--interval", type=int, default=60)
 
     cloud_benchmark = cloud_subparsers.add_parser(
         "benchmark", help="run the hosted GPU-vs-CPU benchmark"
@@ -282,6 +385,8 @@ For full docs, see: https://github.com/kalibraring/maestro-android""",
     cloud_benchmark.add_argument(
         "--flow", default="", help="override benchmark flow path"
     )
+    cloud_benchmark.add_argument("--watch", action="store_true")
+    cloud_benchmark.add_argument("--interval", type=int, default=60)
 
     cloud_status = cloud_subparsers.add_parser(
         "status", help="poll Maestro Cloud upload status"
@@ -293,6 +398,26 @@ For full docs, see: https://github.com/kalibraring/maestro-android""",
     cloud_status.add_argument("--interval", type=int, default=60)
     cloud_status.add_argument("uploads", nargs="+", help="label:upload-id entries")
 
+    cloud_flow = cloud_subparsers.add_parser(
+        "flow", help="run one hosted Maestro flow or flow directory"
+    )
+    cloud_flow.add_argument("flow", help="flow path or flow directory")
+    cloud_flow.add_argument(
+        "--api-levels", default="", help="comma-separated Android API levels"
+    )
+    cloud_flow.add_argument("--no-build", action="store_true")
+    cloud_flow.add_argument(
+        "--project-id", default="", help="override Maestro Cloud project id"
+    )
+    cloud_flow.add_argument(
+        "--device-locale", default="", help="override device locale"
+    )
+    cloud_flow.add_argument(
+        "--tags", default="", help="extra include-tags filter"
+    )
+    cloud_flow.add_argument("--watch", action="store_true")
+    cloud_flow.add_argument("--interval", type=int, default=60)
+
     suggest = subparsers.add_parser(
         "suggest",
         help="suggest which lanes to run based on changed files",
@@ -302,6 +427,114 @@ For full docs, see: https://github.com/kalibraring/maestro-android""",
         "--diff",
         default="HEAD",
         help="git diff target (default: HEAD for uncommitted changes)",
+    )
+
+    device = subparsers.add_parser(
+        "device",
+        help="ad-hoc device inspection and debugging",
+        epilog="Examples:\n  maestro-android device files models/\n  maestro-android device logcat --filter 'MULTIMODAL|SendMessage'\n  maestro-android device ui\n  maestro-android device push mmproj.gguf models/\n  maestro-android device info",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    device.add_argument("--device", default="", help="device serial")
+    device_sub = device.add_subparsers(dest="device_command", required=True)
+
+    device_files = device_sub.add_parser(
+        "files",
+        help="list files in the app's external data directory",
+        epilog="Examples:\n  maestro-android device files\n  maestro-android device files models/",
+    )
+    device_files.add_argument(
+        "path", nargs="?", default="", help="relative path within the app's external data dir"
+    )
+    device_files.add_argument(
+        "--storage",
+        choices=("data", "media"),
+        default="data",
+        help="storage root: Android/data/<app>/files or Android/media/<app>",
+    )
+    device_files.add_argument(
+        "--all", action="store_true", dest="show_all", help="include hidden files (-la)"
+    )
+
+    device_push = device_sub.add_parser(
+        "push",
+        help="push a local file to the app's external data directory",
+        epilog="Examples:\n  maestro-android device push model.gguf models/\n  maestro-android device push config.json",
+    )
+    device_push.add_argument("local_path", help="local file to push")
+    device_push.add_argument(
+        "dest", nargs="?", default="", help="relative destination within app's external data dir"
+    )
+    device_push.add_argument(
+        "--storage",
+        choices=("data", "media"),
+        default="data",
+        help="storage root: Android/data/<app>/files or Android/media/<app>",
+    )
+
+    device_logcat = device_sub.add_parser(
+        "logcat",
+        help="capture logcat for the app process",
+        epilog="Examples:\n  maestro-android device logcat --filter 'MULTIMODAL|SendMessage'\n  maestro-android device logcat --lines 200\n  maestro-android device logcat --follow --filter 'FATAL'",
+    )
+    device_logcat.add_argument(
+        "--filter", default="", dest="logcat_filter", help="regex pattern to filter output (applied client-side)"
+    )
+    device_logcat.add_argument(
+        "--lines", type=int, default=0, help="limit output to the last N matching lines (0 = all)"
+    )
+    device_logcat.add_argument(
+        "--follow", action="store_true", help="stream logcat continuously (Ctrl-C to stop)"
+    )
+    device_logcat.add_argument(
+        "--save", type=Path, default=None, help="save output to a file"
+    )
+
+    device_sub.add_parser(
+        "ui",
+        help="dump the current UI hierarchy (testTags, bounds, text)",
+        epilog="Examples:\n  maestro-android device ui",
+    )
+
+    device_sub.add_parser(
+        "info",
+        help="show app process status, CPU usage, and memory",
+        epilog="Examples:\n  maestro-android device info",
+    )
+
+    device_foreground = device_sub.add_parser(
+        "foreground",
+        help="show the current foreground package/activity",
+        epilog="Examples:\n  maestro-android device foreground\n  maestro-android device foreground --json",
+    )
+    device_foreground.add_argument(
+        "--json",
+        action="store_true",
+        dest="foreground_as_json",
+        help="emit JSON instead of a human-readable summary",
+    )
+
+    device_probe = device_sub.add_parser(
+        "probe",
+        help="check one device and optionally prime Maestro bootstrap",
+        epilog=(
+            "Examples:\n"
+            "  maestro-android device probe --device <serial>\n"
+            "  maestro-android device probe --device emulator-5554 --adb-only\n"
+            "  maestro-android device probe --device <host>:5555 --json"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    device_probe.add_argument(
+        "--adb-only",
+        action="store_true",
+        help="skip the Maestro launch probe and only validate adb/device state",
+    )
+    device_probe.add_argument(
+        "--json",
+        action="store_true",
+        dest="probe_as_json",
+        help="emit JSON instead of a human-readable summary",
     )
 
     return parser
@@ -335,6 +568,20 @@ def _parse_int_csv(raw: str) -> list[int]:
     return values
 
 
+_GENERATED_FLOW_MARKERS = (
+    "prepared-flow",
+    "prepared-no-launch",
+    "prepared-",
+)
+
+
+def _is_generated_flow_path(path: Path) -> bool:
+    name = path.name
+    if name.startswith(".") and name.endswith((".yaml", ".yml")):
+        return True
+    return any(marker in name for marker in _GENERATED_FLOW_MARKERS)
+
+
 def _load_env_file(project_root: Path) -> None:
     env_path = project_root / ".env"
     if not env_path.exists():
@@ -359,7 +606,7 @@ def _resolve_serial(explicit: str) -> str:
     if env_serial:
         return env_serial
     completed = run_subprocess(["adb", "devices", "-l"], capture_output=True, check=False)
-    devices: list[dict[str, str]] = []
+    devices: list[dict[str, Any]] = []
     for line in (completed.stdout or "").splitlines()[1:]:
         stripped = line.strip()
         if not stripped:
@@ -369,29 +616,35 @@ def _resolve_serial(explicit: str) -> str:
             continue
         serial = parts[0]
         details = " ".join(parts[2:])
-        model = ""
-        for token in parts[2:]:
-            if token.startswith("model:"):
-                model = token.split(":", 1)[1]
-                break
-        devices.append({"serial": serial, "details": details, "model": model})
+        detail_map = _parse_device_details(details)
+        devices.append(
+            {
+                "serial": serial,
+                "details": details,
+                "model": detail_map.get("model", ""),
+                "product": detail_map.get("product", ""),
+                "device_name": detail_map.get("device", ""),
+                "transport": _device_transport_kind(serial),
+            }
+        )
     if not devices:
         raise MaestroAndroidError("DEVICE_ERROR", "No connected adb device detected.")
     if len(devices) > 1:
-        models = [d["model"] for d in devices if d["model"]]
-        unique_models = set(models)
-        if len(unique_models) == 1 and len(models) == len(devices):
-            print_step(
-                f"Warning: {len(devices)} transports detected for the same device "
-                f"(model={models[0]}). Using first: {devices[0]['serial']}"
-            )
-            return devices[0]["serial"]
+        duplicate_groups = _duplicate_transport_groups(devices)
+        duplicate_hint = (
+            " Duplicate transports are attached for at least one device."
+            if duplicate_groups
+            else ""
+        )
         raise MaestroAndroidError(
             "DEVICE_ERROR",
-            f"Multiple adb devices detected ({len(devices)}); pass --device. "
-            + ", ".join(f"{d['serial']} ({d['details']})" for d in devices),
+            (
+                f"Multiple adb devices detected ({len(devices)}); pass --device."
+                f"{duplicate_hint} Run `maestro-android devices` to choose one serial. Connected: "
+                + "; ".join(_device_display_name(d) for d in devices)
+            ),
         )
-    return devices[0]["serial"]
+    return str(devices[0]["serial"])
 
 
 def _cloud_project_id(
@@ -472,7 +725,7 @@ def _run_cloud_smoke(
     parsed: argparse.Namespace, config: MaestroAndroidConfig, project_root: Path
 ) -> int:
     _load_env_file(project_root)
-    _cloud_api_key(config)
+    api_key = _cloud_api_key(config)
     project_id = _cloud_project_id(parsed, config, project_root)
     api_levels = (
         _parse_int_csv(parsed.api_levels)
@@ -489,6 +742,7 @@ def _run_cloud_smoke(
     output_root = project_root / "tmp" / "maestro-cloud-smoke"
     output_root.mkdir(parents=True, exist_ok=True)
     exit_code = 0
+    uploads_to_watch: list[str] = []
     for api_level in api_levels:
         run_dir = output_root / f"api-{api_level}"
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -505,6 +759,8 @@ def _run_cloud_smoke(
         (run_dir / "run.log").write_text(
             (completed.stdout or "") + (completed.stderr or ""), encoding="utf-8"
         )
+        upload_ids = _extract_cloud_upload_ids(completed.stdout or "", completed.stderr or "")
+        uploads_to_watch.extend(f"api-{api_level}:{upload_id}" for upload_id in upload_ids)
         _write_json(
             run_dir / "summary.json",
             {
@@ -513,19 +769,106 @@ def _run_cloud_smoke(
                 "device_locale": device_locale,
                 "flows": str(flows_root),
                 "returncode": completed.returncode,
+                "upload_ids": upload_ids,
             },
         )
         if completed.returncode != 0:
             exit_code = 1
     print_step(f"Maestro Cloud smoke artifacts: {output_root}")
+    watch_exit = _watch_cloud_uploads_if_requested(
+        watch=parsed.watch,
+        interval=parsed.interval,
+        project_id=project_id,
+        api_key=api_key,
+        uploads=uploads_to_watch,
+    )
+    if watch_exit != 0:
+        exit_code = watch_exit
     return exit_code
+
+
+def _cloud_probe_run_root(project_root: Path, parsed: argparse.Namespace) -> Path:
+    if parsed.run_root:
+        requested = Path(parsed.run_root)
+        return requested if requested.is_absolute() else (project_root / requested)
+    stamp = datetime.now().strftime("%Y%m%dT%H%M%SZ")
+    return project_root / "tmp" / "maestro-cloud-probe" / stamp
+
+
+def _run_cloud_probe(
+    parsed: argparse.Namespace, config: MaestroAndroidConfig, project_root: Path
+) -> int:
+    _load_env_file(project_root)
+    api_key = _cloud_api_key(config)
+    project_id = _cloud_project_id(parsed, config, project_root)
+    device_locale = parsed.device_locale or config.cloud.device_locale
+    apk_path = _build_apk_if_needed(project_root, config, parsed.no_build)
+    include_tags = _parse_csv(parsed.tags)
+
+    if parsed.flow:
+        flows_target = (
+            (project_root / parsed.flow).resolve()
+            if not Path(parsed.flow).is_absolute()
+            else Path(parsed.flow).resolve()
+        )
+        if not flows_target.exists():
+            raise MaestroAndroidError(
+                "CONFIG_ERROR", f"Hosted flow does not exist: {flows_target}"
+            )
+    else:
+        flows_target = Path(parsed.flows_root or config.cloud.smoke_flows_root)
+        if not include_tags:
+            raise MaestroAndroidError(
+                "CONFIG_ERROR",
+                "cloud probe requires --flow or at least one --tags value",
+            )
+
+    run_root = _cloud_probe_run_root(project_root, parsed)
+    run_root.mkdir(parents=True, exist_ok=True)
+    completed = _run_cloud_maestro(
+        project_root=project_root,
+        apk_path=apk_path,
+        api_level=parsed.api_level,
+        device_locale=device_locale,
+        flows=flows_target,
+        include_tags=include_tags,
+        project_id=project_id,
+        output_path=run_root / "junit.xml",
+    )
+    (run_root / "run.log").write_text(
+        (completed.stdout or "") + (completed.stderr or ""), encoding="utf-8"
+    )
+    upload_ids = _extract_cloud_upload_ids(completed.stdout or "", completed.stderr or "")
+    _write_json(
+        run_root / "summary.json",
+        {
+            "api_level": parsed.api_level,
+            "project_id": project_id,
+            "device_locale": device_locale,
+            "flow": str(flows_target),
+            "tags": include_tags,
+            "returncode": completed.returncode,
+            "upload_ids": upload_ids,
+        },
+    )
+    print_step(f"Maestro Cloud probe artifacts: {run_root}")
+    if completed.returncode != 0:
+        return 1
+    watch_exit = _watch_cloud_uploads_if_requested(
+        watch=parsed.watch,
+        interval=parsed.interval,
+        project_id=project_id,
+        api_key=api_key,
+        uploads=[f"probe:{upload_id}" for upload_id in upload_ids],
+    )
+    return watch_exit
 
 
 def _run_cloud_benchmark(
     parsed: argparse.Namespace, config: MaestroAndroidConfig, project_root: Path
 ) -> int:
     _load_env_file(project_root)
-    _cloud_api_key(config)
+    api_key = _cloud_api_key(config)
     project_id = _cloud_project_id(parsed, config, project_root)
     api_levels = (
         _parse_int_csv(parsed.api_levels)
@@ -539,6 +882,7 @@ def _run_cloud_benchmark(
     output_root = project_root / "tmp" / "maestro-cloud-gpu-benchmark"
     output_root.mkdir(parents=True, exist_ok=True)
     exit_code = 0
+    uploads_to_watch: list[str] = []
     for api_level in api_levels:
         run_dir = output_root / f"api-{api_level}"
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -555,6 +899,8 @@ def _run_cloud_benchmark(
         (run_dir / "run.log").write_text(
             (completed.stdout or "") + (completed.stderr or ""), encoding="utf-8"
         )
+        upload_ids = _extract_cloud_upload_ids(completed.stdout or "", completed.stderr or "")
+        uploads_to_watch.extend(f"api-{api_level}:{upload_id}" for upload_id in upload_ids)
         _write_json(
             run_dir / "summary.json",
             {
@@ -563,11 +909,102 @@ def _run_cloud_benchmark(
                 "device_locale": device_locale,
                 "flow": str(flow),
                 "returncode": completed.returncode,
+                "upload_ids": upload_ids,
             },
         )
         if completed.returncode != 0:
             exit_code = 1
     print_step(f"Maestro Cloud benchmark artifacts: {output_root}")
+    watch_exit = _watch_cloud_uploads_if_requested(
+        watch=parsed.watch,
+        interval=parsed.interval,
+        project_id=project_id,
+        api_key=api_key,
+        uploads=uploads_to_watch,
+    )
+    if watch_exit != 0:
+        exit_code = watch_exit
+    return exit_code
+
+
+def _sanitize_label(raw: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", raw.strip())
+    return cleaned.strip("-") or "flow"
+
+
+def _run_cloud_flow(
+    parsed: argparse.Namespace, config: MaestroAndroidConfig, project_root: Path
+) -> int:
+    _load_env_file(project_root)
+    api_key = _cloud_api_key(config)
+    project_id = _cloud_project_id(parsed, config, project_root)
+    api_levels = (
+        _parse_int_csv(parsed.api_levels)
+        if parsed.api_levels
+        else list(config.cloud.smoke_api_levels)
+    )
+    device_locale = parsed.device_locale or config.cloud.device_locale
+    flow = (
+        (project_root / parsed.flow).resolve()
+        if not Path(parsed.flow).is_absolute()
+        else Path(parsed.flow).resolve()
+    )
+    if not flow.exists():
+        raise MaestroAndroidError("CONFIG_ERROR", f"Flow does not exist: {flow}")
+    include_tags = _parse_csv(parsed.tags)
+    apk_path = _build_apk_if_needed(project_root, config, parsed.no_build)
+
+    output_root = (
+        project_root
+        / "tmp"
+        / "maestro-cloud-targeted"
+        / _sanitize_label(_relativize(flow, project_root))
+    )
+    output_root.mkdir(parents=True, exist_ok=True)
+    exit_code = 0
+    uploads_to_watch: list[str] = []
+    for api_level in api_levels:
+        run_dir = output_root / f"api-{api_level}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        completed = _run_cloud_maestro(
+            project_root=project_root,
+            apk_path=apk_path,
+            api_level=api_level,
+            device_locale=device_locale,
+            flows=flow,
+            include_tags=include_tags,
+            project_id=project_id,
+            output_path=run_dir / "junit.xml",
+        )
+        (run_dir / "run.log").write_text(
+            (completed.stdout or "") + (completed.stderr or ""), encoding="utf-8"
+        )
+        upload_ids = _extract_cloud_upload_ids(completed.stdout or "", completed.stderr or "")
+        uploads_to_watch.extend(f"api-{api_level}:{upload_id}" for upload_id in upload_ids)
+        _write_json(
+            run_dir / "summary.json",
+            {
+                "api_level": api_level,
+                "project_id": project_id,
+                "device_locale": device_locale,
+                "flow": str(flow),
+                "include_tags": include_tags,
+                "returncode": completed.returncode,
+                "upload_ids": upload_ids,
+            },
+        )
+        if completed.returncode != 0:
+            exit_code = 1
+    print_step(f"Maestro Cloud targeted artifacts: {output_root}")
+    watch_exit = _watch_cloud_uploads_if_requested(
+        watch=parsed.watch,
+        interval=parsed.interval,
+        project_id=project_id,
+        api_key=api_key,
+        uploads=uploads_to_watch,
+    )
+    if watch_exit != 0:
+        exit_code = watch_exit
     return exit_code
 
 
@@ -575,11 +1012,9 @@ def _project_root(parsed: argparse.Namespace) -> Path:
     return (parsed.project_root or Path.cwd()).resolve()
 
 
-def _list_devices() -> list[dict[str, str]]:
-    completed = run_subprocess(
-        ["adb", "devices", "-l"], capture_output=True, check=False
-    )
-    devices: list[dict[str, str]] = []
+def _list_devices() -> list[dict[str, Any]]:
+    completed = run_subprocess(["adb", "devices", "-l"], capture_output=True, check=False)
+    devices: list[dict[str, Any]] = []
     for line in (completed.stdout or "").splitlines()[1:]:
         stripped = line.strip()
         if not stripped:
@@ -588,8 +1023,51 @@ def _list_devices() -> list[dict[str, str]]:
         serial = parts[0]
         state = parts[1] if len(parts) > 1 else "unknown"
         details = " ".join(parts[2:]) if len(parts) > 2 else ""
-        devices.append({"serial": serial, "state": state, "details": details})
+        detail_map = _parse_device_details(details)
+        devices.append(
+            {
+                "serial": serial,
+                "state": state,
+                "details": details,
+                "transport": _device_transport_kind(serial),
+                "model": detail_map.get("model", ""),
+                "product": detail_map.get("product", ""),
+                "device_name": detail_map.get("device", ""),
+                "transport_id": detail_map.get("transport_id", ""),
+            }
+        )
     return devices
+
+
+def _device_transport_kind(serial: str) -> str:
+    if serial.startswith("emulator-"):
+        return "emulator"
+    if ":" in serial:
+        return "network"
+    return "usb"
+
+
+def _summarize_devices(devices: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "total": len(devices),
+        "online": 0,
+        "offline": 0,
+        "unauthorized": 0,
+        "emulator": 0,
+        "network": 0,
+        "usb": 0,
+    }
+    for device in devices:
+        state = device.get("state", "unknown")
+        transport = _device_transport_kind(device.get("serial", ""))
+        if state == "device":
+            summary["online"] += 1
+            summary[transport] += 1
+        elif state == "offline":
+            summary["offline"] += 1
+        elif state == "unauthorized":
+            summary["unauthorized"] += 1
+    return summary
 
 
 def _resolve_apk(project_root: Path, config: MaestroAndroidConfig) -> Path | None:
@@ -610,21 +1088,75 @@ def _flow_metadata(path: Path) -> dict[str, Any]:
 
 
 def _discover_flow_paths(
-    project_root: Path, config: MaestroAndroidConfig
+    project_root: Path,
+    config: MaestroAndroidConfig,
+    *,
+    include_generated: bool = False,
 ) -> list[Path]:
     paths: list[Path] = []
     for root in config.flows.roots:
         candidate_root = project_root / root
         if not candidate_root.exists():
             continue
-        paths.extend(sorted(candidate_root.rglob("*.yaml")))
+        for path in sorted(candidate_root.rglob("*.yaml")):
+            if not include_generated and _is_generated_flow_path(path):
+                continue
+            paths.append(path)
     return paths
 
 
 def _discover_all_flow_paths(
+    project_root: Path,
+    config: MaestroAndroidConfig,
+    *,
+    include_generated: bool = False,
+) -> list[Path]:
+    return _discover_flow_paths(
+        project_root,
+        config,
+        include_generated=include_generated,
+    )
+
+
+def _discover_generated_flow_paths(
     project_root: Path, config: MaestroAndroidConfig
 ) -> list[Path]:
-    return _discover_flow_paths(project_root, config)
+    generated: list[Path] = []
+    for root in config.flows.roots:
+        candidate_root = project_root / root
+        if not candidate_root.exists():
+            continue
+        for path in sorted(candidate_root.rglob("*.yaml")):
+            if _is_generated_flow_path(path):
+                generated.append(path)
+    return generated
+
+
+def _looks_like_generated_prepared_flow(path: Path) -> bool:
+    name = path.name
+    return name.endswith("-prepared-flow.yaml") or name.endswith("-prepared-flow.yml")
+
+
+def _find_generated_prepared_flows(
+    project_root: Path, config: MaestroAndroidConfig, *, min_age_days: int = 0
+) -> list[Path]:
+    roots = {project_root / "tmp"}
+    roots.update(project_root / root for root in config.flows.roots)
+    threshold = 0.0
+    if min_age_days > 0:
+        threshold = _time.time() - float(min_age_days) * 86400.0
+
+    matches: list[Path] = []
+    for root in sorted(roots):
+        if not root.exists():
+            continue
+        for candidate in root.rglob("*.y*ml"):
+            if not _looks_like_generated_prepared_flow(candidate):
+                continue
+            if threshold and candidate.stat().st_mtime > threshold:
+                continue
+            matches.append(candidate)
+    return sorted(set(matches))
 
 
 def _select_flows(
@@ -717,6 +1249,235 @@ def _relativize(path: Path, project_root: Path) -> str:
         return str(path)
 
 
+_FOREGROUND_COMPONENT_PATTERN = re.compile(
+    r"(?P<package>[A-Za-z0-9._$]+)/(?P<activity>[A-Za-z0-9._$/]+)"
+)
+_FOREGROUND_SIGNAL_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"mCurrentFocus=.*?(?P<component>[A-Za-z0-9._$]+/[A-Za-z0-9._$/]+)"),
+    re.compile(r"topResumedActivity:.*?(?P<component>[A-Za-z0-9._$]+/[A-Za-z0-9._$/]+)"),
+    re.compile(r"ResumedActivity:.*?(?P<component>[A-Za-z0-9._$]+/[A-Za-z0-9._$/]+)"),
+)
+_SYSTEM_PERMISSION_PACKAGES = {
+    "com.google.android.permissioncontroller",
+    "com.android.permissioncontroller",
+}
+_PLAY_STORE_PACKAGE = "com.android.vending"
+_CLOUD_UPLOAD_ID_PATTERN = re.compile(r"\bmupload_[A-Za-z0-9_-]+\b")
+
+
+def _parse_foreground_component(raw_text: str) -> dict[str, str | None]:
+    for pattern in _FOREGROUND_SIGNAL_PATTERNS:
+        match = pattern.search(raw_text)
+        if not match:
+            continue
+        component = match.group("component")
+        component_match = _FOREGROUND_COMPONENT_PATTERN.search(component)
+        if component_match:
+            return {
+                "component": component,
+                "package": component_match.group("package"),
+                "activity": component_match.group("activity"),
+            }
+    return {"component": None, "package": None, "activity": None}
+
+
+def _parse_device_details(details: str) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for token in details.split():
+        if ":" not in token:
+            continue
+        key, value = token.split(":", 1)
+        if key and value:
+            parsed[key] = value
+    return parsed
+
+
+def _device_identity_key(device: dict[str, Any]) -> tuple[str, str, str] | None:
+    model = str(device.get("model") or "").strip()
+    product = str(device.get("product") or "").strip()
+    hardware = str(device.get("device_name") or "").strip()
+    if not any((model, product, hardware)):
+        return None
+    return (model, product, hardware)
+
+
+def _duplicate_transport_groups(
+    devices: Sequence[dict[str, Any]]
+) -> list[list[dict[str, Any]]]:
+    groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for device in devices:
+        if device.get("state") != "device":
+            continue
+        identity = _device_identity_key(device)
+        if identity is None:
+            continue
+        groups.setdefault(identity, []).append(device)
+    return [group for group in groups.values() if len(group) > 1]
+
+
+def _device_display_name(device: dict[str, Any]) -> str:
+    parts = [str(device.get("serial", "")).strip()]
+    state = str(device.get("state", "")).strip()
+    if state:
+        parts.append(f"[{state}]")
+    transport = str(device.get("transport") or _device_transport_kind(str(device.get("serial", ""))))
+    if transport:
+        parts.append(f"transport={transport}")
+    if device.get("model"):
+        parts.append(f"model={device['model']}")
+    if device.get("product"):
+        parts.append(f"product={device['product']}")
+    if device.get("device_name"):
+        parts.append(f"device={device['device_name']}")
+    aliases = [str(alias).strip() for alias in device.get("aliases", []) if str(alias).strip()]
+    if aliases:
+        parts.append(f"aliases={','.join(aliases)}")
+    details = str(device.get("details", "")).strip()
+    if details and not any(
+        token in details
+        for token in (
+            f"model:{device.get('model', '')}",
+            f"product:{device.get('product', '')}",
+            f"device:{device.get('device_name', '')}",
+        )
+    ):
+        parts.append(details)
+    return " ".join(part for part in parts if part)
+
+
+def _doctor_recommendations(
+    config: MaestroAndroidConfig,
+    device_summary: dict[str, Any],
+    duplicate_groups: Sequence[Sequence[dict[str, Any]]],
+    cloud_ready: bool,
+) -> list[str]:
+    recommendations: list[str] = []
+    if not device_summary.get("emulator"):
+        recommendations.append(
+            "Emulator proof missing: run `maestro-android start-device` then your local smoke/scoped check."
+        )
+    if not device_summary.get("online"):
+        recommendations.append(
+            "Connected-device proof missing: attach one phone and run `maestro-android lane smoke --device <serial>`."
+        )
+    elif duplicate_groups:
+        chosen_serial = str(duplicate_groups[0][0].get("serial", "")).strip() or "<serial>"
+        recommendations.append(
+            "Multiple transports are attached; pin one target explicitly, for example "
+            f"`maestro-android lane smoke --device {chosen_serial}`."
+        )
+    if not cloud_ready:
+        recommendations.append(
+            "Hosted proof unavailable: set "
+            f"`{config.cloud.api_key_env}` and `{config.cloud.project_id_env}`, then run "
+            "`maestro-android cloud probe --flow <path>` or `maestro-android cloud smoke`."
+        )
+    elif cloud_ready:
+        recommendations.append(
+            "Hosted proof ready: use `maestro-android cloud probe --flow <path>` for a narrow rerun before `cloud smoke`."
+        )
+    return recommendations
+
+
+def _extract_cloud_upload_ids(*texts: str) -> list[str]:
+    upload_ids: list[str] = []
+    for text in texts:
+        for upload_id in _CLOUD_UPLOAD_ID_PATTERN.findall(text or ""):
+            if upload_id not in upload_ids:
+                upload_ids.append(upload_id)
+    return upload_ids
+
+
+def _watch_cloud_uploads_if_requested(
+    *,
+    watch: bool,
+    interval: int,
+    project_id: str,
+    api_key: str,
+    uploads: Sequence[str],
+) -> int:
+    if not watch or not uploads:
+        return 0
+    return _run_cloud_status_command(
+        project_id=project_id,
+        api_key=api_key,
+        uploads=uploads,
+        watch=True,
+        interval=interval,
+    )
+
+
+def _classify_foreground_package(package_name: str | None, app_id: str) -> str:
+    if not package_name:
+        return "unknown"
+    if package_name == app_id:
+        return "app"
+    if package_name in _SYSTEM_PERMISSION_PACKAGES:
+        return "system_permission_dialog"
+    if package_name == _PLAY_STORE_PACKAGE:
+        return "play_store"
+    return "external"
+
+
+def _collect_foreground_snapshot(serial: str, app_id: str) -> dict[str, Any]:
+    window_dump = run_subprocess(
+        ["adb", "-s", serial, "shell", "dumpsys", "window", "windows"],
+        capture_output=True,
+        check=False,
+    )
+    activity_dump = run_subprocess(
+        ["adb", "-s", serial, "shell", "dumpsys", "activity", "activities"],
+        capture_output=True,
+        check=False,
+    )
+    window_text = window_dump.stdout or ""
+    activity_text = activity_dump.stdout or ""
+    parsed = _parse_foreground_component(f"{window_text}\n{activity_text}")
+    classification = _classify_foreground_package(parsed["package"], app_id)
+    return {
+        "serial": serial,
+        "app_id": app_id,
+        "classification": classification,
+        "component": parsed["component"],
+        "package": parsed["package"],
+        "activity": parsed["activity"],
+        "window_dump": window_text,
+        "activity_dump": activity_text,
+    }
+
+
+def _write_flow_state(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(path, payload)
+
+
+def _capture_failure_context(serial: str, app_id: str, flow_dir: Path) -> dict[str, Any]:
+    context_dir = flow_dir / "failure-context"
+    context_dir.mkdir(parents=True, exist_ok=True)
+
+    foreground = _collect_foreground_snapshot(serial, app_id)
+    foreground_path = context_dir / "foreground.json"
+    _write_json(foreground_path, foreground)
+
+    ui_completed = run_subprocess(
+        ["adb", "-s", serial, "exec-out", "uiautomator", "dump", "/dev/tty"],
+        capture_output=True,
+        check=False,
+    )
+    raw_ui = (ui_completed.stdout or "").replace(
+        "UI hierchary dumped to: /dev/tty", ""
+    ).strip()
+    ui_path = context_dir / "ui.xml"
+    if raw_ui:
+        ui_path.write_text(raw_ui + "\n", encoding="utf-8")
+
+    return {
+        "foreground": foreground,
+        "foreground_path": foreground_path,
+        "ui_path": ui_path if raw_ui else None,
+    }
+
+
 _FAILURE_HINTS: list[tuple[str, str]] = [
     (r"FATAL EXCEPTION.*NullPointerException", "App crashed with NullPointerException. Check the stack trace in logcat.txt."),
     (r"FATAL EXCEPTION", "App crashed with a fatal exception. Check logcat.txt for the full stack trace."),
@@ -730,6 +1491,34 @@ _FAILURE_HINTS: list[tuple[str, str]] = [
 
 
 def _diagnose_failure(flow_result: dict[str, Any], artifact_root: Path) -> None:
+    foreground_rel = flow_result.get("foreground")
+    if foreground_rel:
+        foreground_path = artifact_root / foreground_rel
+        if foreground_path.exists():
+            foreground_payload = json.loads(
+                foreground_path.read_text(encoding="utf-8")
+            )
+            classification = foreground_payload.get("classification")
+            component = foreground_payload.get("component") or "unknown"
+            if classification == "system_permission_dialog":
+                print_step(
+                    "Hint: a system permission dialog took the foreground. "
+                    f"Current top activity: {component}."
+                )
+                return
+            if classification == "play_store":
+                print_step(
+                    "Hint: the app lost foreground to the Play Store. "
+                    f"Current top activity: {component}."
+                )
+                return
+            if classification == "external":
+                print_step(
+                    "Hint: the app lost foreground to another package. "
+                    f"Current top activity: {component}."
+                )
+                return
+
     texts_to_scan: list[str] = []
     for key in ("logcat", "stderr"):
         rel = flow_result.get(key)
@@ -782,6 +1571,7 @@ def _run_maestro_flow(
     flow_dir = artifact_root / "flows" / flow.stem
     debug_dir = flow_dir / "maestro-debug"
     debug_dir.mkdir(parents=True, exist_ok=True)
+    state_path = flow_dir / "flow-state.json"
     run_subprocess(
         ["adb", "-s", serial, "logcat", "-c"],
         check=False,
@@ -808,44 +1598,129 @@ def _run_maestro_flow(
         *extra_args,
     ]
     started_at = _time.time()
-    completed = run_subprocess(
-        command,
-        capture_output=True,
-        check=False,
-        cwd=project_root,
-        timeout_seconds=maestro_timeout_sec,
+    _write_flow_state(
+        state_path,
+        {
+            "flow": _relativize(flow, project_root),
+            "status": "running",
+            "serial": serial,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "command": command,
+        },
     )
-    finished_at = _time.time()
-    duration_s = round(finished_at - started_at, 1)
-
     junit_path = flow_dir / "junit.xml"
     stderr_path = flow_dir / "maestro-stderr.log"
     stdout_path = flow_dir / "maestro-stdout.log"
-    if output_format == "junit":
-        junit_path.write_text(completed.stdout or "", encoding="utf-8")
-    else:
-        stdout_path.write_text(completed.stdout or "", encoding="utf-8")
-    stderr_path.write_text(completed.stderr or "", encoding="utf-8")
     logcat_path = flow_dir / "logcat.txt"
-    _capture_logcat(serial, logcat_path, timeout_seconds=adb_timeout_sec)
-
-    return {
-        "flow": _relativize(flow, project_root),
-        "status": "passed" if completed.returncode == 0 else "failed",
-        "started_at": started_at,
-        "finished_at": finished_at,
-        "duration_s": duration_s,
-        "returncode": completed.returncode,
-        "junit": str(junit_path.relative_to(artifact_root))
-        if junit_path.exists()
-        else None,
-        "stderr": str(stderr_path.relative_to(artifact_root)),
-        "stdout": str(stdout_path.relative_to(artifact_root))
-        if stdout_path.exists()
-        else None,
-        "logcat": str(logcat_path.relative_to(artifact_root)),
-        "debug_output": str(debug_dir.relative_to(artifact_root)),
-    }
+    try:
+        completed = run_subprocess(
+            command,
+            capture_output=True,
+            check=False,
+            cwd=project_root,
+            timeout_seconds=maestro_timeout_sec,
+        )
+        finished_at = _time.time()
+        duration_s = round(finished_at - started_at, 1)
+        if output_format == "junit":
+            junit_path.write_text(completed.stdout or "", encoding="utf-8")
+        else:
+            stdout_path.write_text(completed.stdout or "", encoding="utf-8")
+        stderr_path.write_text(completed.stderr or "", encoding="utf-8")
+        _capture_logcat(serial, logcat_path, timeout_seconds=adb_timeout_sec)
+        failure_context = (
+            _capture_failure_context(serial, app_id, flow_dir)
+            if completed.returncode != 0
+            else None
+        )
+        result = {
+            "flow": _relativize(flow, project_root),
+            "status": "passed" if completed.returncode == 0 else "failed",
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "duration_s": duration_s,
+            "returncode": completed.returncode,
+            "junit": str(junit_path.relative_to(artifact_root))
+            if junit_path.exists()
+            else None,
+            "stderr": str(stderr_path.relative_to(artifact_root)),
+            "stdout": str(stdout_path.relative_to(artifact_root))
+            if stdout_path.exists()
+            else None,
+            "logcat": str(logcat_path.relative_to(artifact_root)),
+            "debug_output": str(debug_dir.relative_to(artifact_root)),
+        }
+        if failure_context is not None:
+            result["foreground"] = str(
+                failure_context["foreground_path"].relative_to(artifact_root)
+            )
+            if failure_context["ui_path"] is not None:
+                result["ui_dump"] = str(
+                    failure_context["ui_path"].relative_to(artifact_root)
+                )
+        _write_flow_state(
+            state_path,
+            {
+                "flow": result["flow"],
+                "status": result["status"],
+                "serial": serial,
+                "started_at": datetime.fromtimestamp(started_at).isoformat(
+                    timespec="seconds"
+                ),
+                "finished_at": datetime.fromtimestamp(finished_at).isoformat(
+                    timespec="seconds"
+                ),
+                "duration_s": duration_s,
+                "command": command,
+                "returncode": completed.returncode,
+            },
+        )
+        return result
+    except MaestroAndroidError as exc:
+        finished_at = _time.time()
+        duration_s = round(finished_at - started_at, 1)
+        stderr_path.write_text(exc.message + "\n", encoding="utf-8")
+        _capture_logcat(serial, logcat_path, timeout_seconds=adb_timeout_sec)
+        failure_context = _capture_failure_context(serial, app_id, flow_dir)
+        result = {
+            "flow": _relativize(flow, project_root),
+            "status": "failed",
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "duration_s": duration_s,
+            "returncode": None,
+            "junit": None,
+            "stderr": str(stderr_path.relative_to(artifact_root)),
+            "stdout": None,
+            "logcat": str(logcat_path.relative_to(artifact_root)),
+            "debug_output": str(debug_dir.relative_to(artifact_root)),
+            "foreground": str(
+                failure_context["foreground_path"].relative_to(artifact_root)
+            ),
+        }
+        if failure_context["ui_path"] is not None:
+            result["ui_dump"] = str(
+                failure_context["ui_path"].relative_to(artifact_root)
+            )
+        _write_flow_state(
+            state_path,
+            {
+                "flow": result["flow"],
+                "status": "failed",
+                "serial": serial,
+                "started_at": datetime.fromtimestamp(started_at).isoformat(
+                    timespec="seconds"
+                ),
+                "finished_at": datetime.fromtimestamp(finished_at).isoformat(
+                    timespec="seconds"
+                ),
+                "duration_s": duration_s,
+                "command": command,
+                "error_code": exc.code,
+                "error_message": exc.message,
+            },
+        )
+        return result
 
 
 def _execute_test_run(
@@ -952,13 +1827,17 @@ def _run_lane(
             raise MaestroAndroidError(
                 "CONFIG_ERROR", f"Lane '{parsed.name}' is missing a command"
             )
-        run_subprocess(command, cwd=project_root)
+        env_override = dict(os.environ)
+        if parsed.device:
+            env_override["ANDROID_SERIAL"] = parsed.device
+            env_override["ADB_SERIAL"] = parsed.device
+        run_subprocess(command, cwd=project_root, env=env_override)
         return
     if extra_args:
         raise MaestroAndroidError(
             "CONFIG_ERROR", f"Lane '{parsed.name}' does not accept extra args."
         )
-    serial = _resolve_serial("")
+    serial = _resolve_serial(parsed.device)
     flows = _select_flows(
         project_root,
         config,
@@ -1043,27 +1922,74 @@ def _scan_logcat(
     return matches
 
 
+def _append_gradle_properties(
+    command: Sequence[str], gradle_properties: Sequence[str]
+) -> list[str]:
+    appended = list(command)
+    for prop in gradle_properties:
+        appended.append(prop if prop.startswith("-P") else f"-P{prop}")
+    return appended
+
+
+def _parse_key_value_args(
+    raw_values: Sequence[str], option_name: str
+) -> dict[str, str]:
+    parsed_values: dict[str, str] = {}
+    for raw_value in raw_values:
+        key, separator, value = raw_value.partition("=")
+        if not separator or not key.strip() or not value.strip():
+            raise MaestroAndroidError(
+                "CONFIG_ERROR",
+                f"Invalid {option_name} value '{raw_value}'. Expected key=value.",
+            )
+        parsed_values[key.strip()] = value.strip()
+    return parsed_values
+
+
+def _append_instrumentation_runner_args(
+    command: Sequence[str], runner_args: dict[str, str]
+) -> list[str]:
+    appended = list(command)
+    for key, value in runner_args.items():
+        appended.append(f"-Pandroid.testInstrumentationRunnerArguments.{key}={value}")
+    return appended
+
+
 def _run_scoped_gradle(
     parsed: argparse.Namespace,
     config: MaestroAndroidConfig,
     project_root: Path,
-    serial: str,
+    serial: str | None,
     artifact_root: Path,
 ) -> int:
-    run_subprocess(
-        ["adb", "-s", serial, "logcat", "-c"],
-        check=False,
-        cwd=project_root,
-        timeout_seconds=float(parsed.adb_timeout_sec),
-    )
     if parsed.scoped_type == "unit":
+        if parsed.runner_args:
+            raise MaestroAndroidError(
+                "CONFIG_ERROR",
+                "--runner-arg is only supported with --type instrumented",
+            )
         task = "testDebugUnitTest"
+        command = _append_gradle_properties(["./gradlew", task], parsed.gradle_properties)
+        if parsed.test_class:
+            command.append(f"--tests={parsed.test_class}")
+        runner_args: dict[str, str] = {}
     else:
+        assert serial is not None
+        run_subprocess(
+            ["adb", "-s", serial, "logcat", "-c"],
+            check=False,
+            cwd=project_root,
+            timeout_seconds=float(parsed.adb_timeout_sec),
+        )
         task = "connectedDebugAndroidTest"
-    command = ["./gradlew", task]
-    if parsed.test_class:
-        command.append(f"--tests={parsed.test_class}")
-    env_override = {**os.environ, "ANDROID_SERIAL": serial}
+        command = _append_gradle_properties(["./gradlew", task], parsed.gradle_properties)
+        runner_args = _parse_key_value_args(parsed.runner_args, "--runner-arg")
+        if parsed.test_class and "class" not in runner_args:
+            runner_args["class"] = parsed.test_class
+        command = _append_instrumentation_runner_args(command, runner_args)
+    env_override = dict(os.environ)
+    if serial:
+        env_override["ANDROID_SERIAL"] = serial
     completed = run_subprocess(
         command, capture_output=True, check=False, cwd=project_root,
         env=env_override,
@@ -1072,8 +1998,11 @@ def _run_scoped_gradle(
     stderr_path = artifact_root / "gradle-stderr.log"
     stdout_path.write_text(completed.stdout or "", encoding="utf-8")
     stderr_path.write_text(completed.stderr or "", encoding="utf-8")
-    logcat_path = artifact_root / "logcat.txt"
-    _capture_logcat(serial, logcat_path, timeout_seconds=float(parsed.adb_timeout_sec))
+    logcat_name: str | None = None
+    if serial is not None:
+        logcat_path = artifact_root / "logcat.txt"
+        _capture_logcat(serial, logcat_path, timeout_seconds=float(parsed.adb_timeout_sec))
+        logcat_name = "logcat.txt"
 
     status = "passed" if completed.returncode == 0 else "failed"
     manifest = {
@@ -1086,10 +2015,12 @@ def _run_scoped_gradle(
             "flow": parsed.test_class or task,
             "status": status,
             "returncode": completed.returncode,
-            "logcat": "logcat.txt",
+            "logcat": logcat_name,
             "stderr": "gradle-stderr.log",
         }],
     }
+    if runner_args:
+        manifest["runner_args"] = runner_args
     _write_json(artifact_root / "run-manifest.json", manifest)
     print_step(f"Scoped {parsed.scoped_type} artifacts: {artifact_root}")
     if status != "passed":
@@ -1104,28 +2035,41 @@ def _run_scoped_gradle(
 def _run_scoped(
     parsed: argparse.Namespace, config: MaestroAndroidConfig, project_root: Path
 ) -> int:
+    serial = None if parsed.scoped_type == "unit" else _resolve_serial(parsed.device)
+    artifact_root = _normalize_artifact_root(
+        project_root / config.artifacts.scratch_root, serial or "host", "scoped"
+    )
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    env_override = dict(os.environ)
+    if serial:
+        env_override["ANDROID_SERIAL"] = serial
+
+    if not parsed.no_build:
+        build_cmd = _append_gradle_properties(
+            list(config.project.build_command),
+            parsed.gradle_properties,
+        )
+        run_subprocess(build_cmd, cwd=project_root, env=env_override)
+    if not parsed.no_install and parsed.scoped_type != "unit":
+        install_cmd = _append_gradle_properties(
+            list(config.project.install_command),
+            parsed.gradle_properties,
+        )
+        run_subprocess(install_cmd, cwd=project_root, env=env_override)
+
+    if parsed.scoped_type != "maestro":
+        return _run_scoped_gradle(parsed, config, project_root, serial, artifact_root)
+    if not parsed.flow:
+        raise MaestroAndroidError(
+            "CONFIG_ERROR",
+            "--flow is required unless --type is instrumented or unit",
+        )
     flow_path = (
         (project_root / parsed.flow).resolve()
         if not Path(parsed.flow).is_absolute()
         else Path(parsed.flow).resolve()
     )
     _validate_scoped_flow(flow_path, config, project_root)
-    serial = _resolve_serial(parsed.device)
-    artifact_root = _normalize_artifact_root(
-        project_root / config.artifacts.scratch_root, serial, "scoped"
-    )
-    artifact_root.mkdir(parents=True, exist_ok=True)
-
-    if not parsed.no_build:
-        build_cmd = list(config.project.build_command)
-        for prop in parsed.gradle_properties:
-            build_cmd.append(f"-P{prop}")
-        run_subprocess(build_cmd, cwd=project_root)
-    if not parsed.no_install:
-        run_subprocess(config.project.install_command, cwd=project_root)
-
-    if parsed.scoped_type != "maestro":
-        return _run_scoped_gradle(parsed, config, project_root, serial, artifact_root)
 
     extra_args = list(parsed.extra_args)
     if extra_args and extra_args[0] == "--":
@@ -1234,6 +2178,13 @@ _MAESTRO_COMMANDS = {
 
 def _lint_flow(path: Path, strict: bool) -> list[dict[str, str]]:
     issues: list[dict[str, str]] = []
+    if _looks_like_generated_prepared_flow(path):
+        issues.append(
+            {
+                "level": "warning",
+                "message": "Generated prepared-flow artifact checked into the flow tree; clean it before widening runs",
+            }
+        )
     try:
         text = path.read_text(encoding="utf-8")
     except Exception as exc:
@@ -1334,10 +2285,21 @@ def _run_lint(
             if not p.exists():
                 raise MaestroAndroidError("CONFIG_ERROR", f"Flow does not exist: {p}")
     else:
-        flow_paths = _discover_all_flow_paths(project_root, config)
+        flow_paths = _discover_all_flow_paths(
+            project_root,
+            config,
+            include_generated=parsed.include_generated_flows,
+        )
     if not flow_paths:
         print_step("No flows found to lint.")
         return 0
+    if not parsed.include_generated_flows:
+        generated_count = len(_discover_generated_flow_paths(project_root, config))
+        if generated_count:
+            print_step(
+                f"Skipping {generated_count} generated/prepared flow files "
+                "(use --include-generated-flows to lint them)"
+            )
 
     total_errors = 0
     total_warnings = 0
@@ -1409,7 +2371,11 @@ def _run_audit_testtags(
         return 1
 
     kotlin_tags = _scan_kotlin_test_tags(source_roots)
-    flow_paths = _discover_all_flow_paths(project_root, config)
+    flow_paths = _discover_all_flow_paths(
+        project_root,
+        config,
+        include_generated=getattr(parsed, "include_generated_flows", False),
+    )
     flow_ids = _scan_flow_ids(flow_paths)
 
     all_tags = sorted(set(kotlin_tags.keys()) | set(flow_ids.keys()))
@@ -1461,7 +2427,11 @@ def _run_audit_selectors(
         return 1
 
     kotlin_tags = _scan_kotlin_test_tags(source_roots)
-    flow_paths = _discover_all_flow_paths(project_root, config)
+    flow_paths = _discover_all_flow_paths(
+        project_root,
+        config,
+        include_generated=getattr(parsed, "include_generated_flows", False),
+    )
     flow_ids = _scan_flow_ids(flow_paths)
 
     dangling: list[tuple[str, list[str]]] = []
@@ -1545,6 +2515,35 @@ def _run_merge_reports(parsed: argparse.Namespace) -> None:
 
 def _run_clean(parsed: argparse.Namespace, config: MaestroAndroidConfig) -> None:
     project_root = _project_root(parsed)
+    if getattr(parsed, "generated_flows", False):
+        generated = _discover_generated_flow_paths(project_root, config)
+        if not generated:
+            print_step("No generated/prepared flow files found.")
+        else:
+            for path in generated:
+                print_step(f"Removing generated flow {path}")
+                with suppress(FileNotFoundError):
+                    path.unlink()
+    if getattr(parsed, "stale_flows", False):
+        matches = _find_generated_prepared_flows(
+            project_root, config, min_age_days=max(0, int(getattr(parsed, "days", 0)))
+        )
+        if not matches:
+            print_step("No generated prepared-flow files found.")
+            return
+        for match in matches:
+            print(_relativize(match, project_root))
+        if not getattr(parsed, "confirm", False):
+            print()
+            print_step(
+                f"Dry run: {len(matches)} generated flow file(s) listed. Re-run with --confirm to delete them."
+            )
+            return
+        for match in matches:
+            match.unlink(missing_ok=True)
+        print_step(f"Removed {len(matches)} generated flow file(s).")
+        return
+
     roots = [project_root / config.artifacts.clean_roots[0]]
     if parsed.include_repo_artifacts:
         roots = [project_root / root for root in config.artifacts.clean_roots]
@@ -1635,10 +2634,14 @@ def _run_cloud(
             extra_args = extra_args[1:]
         run_subprocess(["maestro", "cloud", *extra_args], cwd=project_root)
         return 0
+    if parsed.cloud_command == "probe":
+        return _run_cloud_probe(parsed, config, project_root)
     if parsed.cloud_command == "smoke":
         return _run_cloud_smoke(parsed, config, project_root)
     if parsed.cloud_command == "benchmark":
         return _run_cloud_benchmark(parsed, config, project_root)
+    if parsed.cloud_command == "flow":
+        return _run_cloud_flow(parsed, config, project_root)
     if parsed.cloud_command == "status":
         _load_env_file(project_root)
         api_key = _cloud_api_key(config)
@@ -1657,6 +2660,7 @@ def _run_cloud(
 
 def _run_doctor(parsed: argparse.Namespace, config: MaestroAndroidConfig) -> int:
     project_root = _project_root(parsed)
+    config_path = parsed.config or (project_root / ".maestro-android.yaml")
     checks: list[dict[str, Any]] = []
     for command_name in config.doctor.required_commands:
         checks.append(
@@ -1697,6 +2701,30 @@ def _run_doctor(parsed: argparse.Namespace, config: MaestroAndroidConfig) -> int
             "ok": bool(os.environ.get(config.cloud.api_key_env)),
         }
     )
+    checks.append(
+        {
+            "name": config.cloud.project_id_env,
+            "kind": "optional-cloud-env",
+            "ok": bool(os.environ.get(config.cloud.project_id_env)),
+        }
+    )
+    devices: list[dict[str, str]] = []
+    device_summary = {
+        "total": 0,
+        "online": 0,
+        "offline": 0,
+        "unauthorized": 0,
+        "emulator": 0,
+        "network": 0,
+        "usb": 0,
+    }
+    apk_path = _resolve_apk(project_root, config)
+    flow_paths = _discover_all_flow_paths(
+        project_root,
+        config,
+        include_generated=parsed.include_generated_flows,
+    )
+    generated_flow_paths = _discover_generated_flow_paths(project_root, config)
     adb_ok = shutil.which("adb") is not None
     if adb_ok:
         completed = run_subprocess(
@@ -1705,15 +2733,105 @@ def _run_doctor(parsed: argparse.Namespace, config: MaestroAndroidConfig) -> int
         checks.append(
             {"name": "adb-devices", "kind": "runtime", "ok": completed.returncode == 0}
         )
+        if completed.returncode == 0:
+            devices = _list_devices()
+            device_summary = _summarize_devices(devices)
+    duplicate_groups = _duplicate_transport_groups(devices)
+    cloud_ready = all(
+        bool(os.environ.get(env_name))
+        for env_name in (config.cloud.api_key_env, config.cloud.project_id_env)
+    )
+    recommendations = _doctor_recommendations(
+        config=config,
+        device_summary=device_summary,
+        duplicate_groups=duplicate_groups,
+        cloud_ready=cloud_ready,
+    )
     if parsed.as_json:
         print(
-            json.dumps({"project_root": str(project_root), "checks": checks}, indent=2)
+            json.dumps(
+                {
+                    "project_root": str(project_root),
+                    "config_path": str(config_path),
+                    "checks": checks,
+                    "devices": devices,
+                    "device_summary": device_summary,
+                    "duplicate_transport_groups": duplicate_groups,
+                    "apk": {
+                        "glob": config.project.apk_glob,
+                        "resolved": str(apk_path) if apk_path else None,
+                    },
+                    "flows": {
+                        "roots": list(config.flows.roots),
+                        "discovered": len(flow_paths),
+                        "generated": len(generated_flow_paths),
+                        "include_generated": parsed.include_generated_flows,
+                    },
+                    "cloud": {
+                        "api_key_env": config.cloud.api_key_env,
+                        "api_key_present": bool(os.environ.get(config.cloud.api_key_env)),
+                        "project_id_env": config.cloud.project_id_env,
+                        "project_id_present": bool(os.environ.get(config.cloud.project_id_env)),
+                        "device_locale": config.cloud.device_locale,
+                        "smoke_api_levels": list(config.cloud.smoke_api_levels),
+                        "smoke_flows_root": config.cloud.smoke_flows_root,
+                        "smoke_tags": list(config.cloud.smoke_tags),
+                    },
+                    "matrix": {
+                        "local_device": device_summary["online"] > 0,
+                        "emulator": device_summary["emulator"] > 0,
+                        "cloud_ready": cloud_ready,
+                    },
+                    "recommendations": recommendations,
+                },
+                indent=2,
+            )
         )
     else:
         print(f"Project root: {project_root}")
+        print(f"Config path:  {config_path}")
         for check in checks:
             status = "ok" if check["ok"] else "missing"
             print(f"{status:7} {check['kind']:17} {check['name']}")
+        print()
+        print("Test matrix:")
+        print(
+            "  local devices: "
+            f"{device_summary['online']} online"
+            f" (usb={device_summary['usb']}, network={device_summary['network']}, emulator={device_summary['emulator']})"
+        )
+        if device_summary["offline"] or device_summary["unauthorized"]:
+            print(
+                "  adb issues: "
+                f"offline={device_summary['offline']} unauthorized={device_summary['unauthorized']}"
+            )
+        print(f"  apk resolved:   {apk_path or 'missing'}")
+        print(f"  cloud ready: {'yes' if cloud_ready else 'no'}")
+        if duplicate_groups:
+            print("  duplicates:     yes")
+        else:
+            print("  duplicates:     no")
+        print()
+        print("Flow hygiene:")
+        print(f"  roots:          {', '.join(config.flows.roots)}")
+        print(f"  discovered:     {len(flow_paths)}")
+        print(f"  generated:      {len(generated_flow_paths)}")
+        if generated_flow_paths and not parsed.include_generated_flows:
+            print("  hint:           run `maestro-android clean --stale-flows` or `--generated-flows`")
+        print()
+        print("Hosted defaults:")
+        print(f"  locale:         {config.cloud.device_locale}")
+        print(
+            "  smoke matrix:   "
+            f"api={','.join(str(v) for v in config.cloud.smoke_api_levels)} "
+            f"tags={','.join(config.cloud.smoke_tags)} "
+            f"root={config.cloud.smoke_flows_root}"
+        )
+        if recommendations:
+            print()
+            print("Next commands:")
+            for recommendation in recommendations:
+                print(f"  - {recommendation}")
         if any(
             check["kind"] == "project-config" and not check["ok"] for check in checks
         ):
@@ -1728,14 +2846,33 @@ def _run_doctor(parsed: argparse.Namespace, config: MaestroAndroidConfig) -> int
     )
 
 
-def _run_devices() -> None:
+def _run_devices(parsed: argparse.Namespace) -> None:
     devices = _list_devices()
     if not devices:
-        print("No adb devices detected.")
+        if getattr(parsed, "as_json", False):
+            print(json.dumps({"devices": [], "duplicate_transport_groups": []}, indent=2))
+        else:
+            print("No adb devices detected.")
+        return
+    duplicate_groups = _duplicate_transport_groups(devices)
+    if getattr(parsed, "as_json", False):
+        print(
+            json.dumps(
+                {
+                    "devices": devices,
+                    "duplicate_transport_groups": duplicate_groups,
+                },
+                indent=2,
+            )
+        )
         return
     for device in devices:
-        detail = f" {device['details']}" if device["details"] else ""
-        print(f"{device['serial']} [{device['state']}] {detail}".rstrip())
+        print(_device_display_name(device))
+    if duplicate_groups:
+        print()
+        print_step(
+            "Duplicate transports detected for at least one device. Pin the target serial with `--device`."
+        )
 
 
 def _run_init(parsed: argparse.Namespace, project_root: Path) -> int:
@@ -1760,6 +2897,51 @@ def _run_init(parsed: argparse.Namespace, project_root: Path) -> int:
     return 0
 
 
+def _wait_for_new_emulator(existing_serials: set[str], timeout_seconds: int) -> str:
+    deadline = _time.time() + float(timeout_seconds)
+    fallback_serial = ""
+    while _time.time() < deadline:
+        devices = _list_devices()
+        for device in devices:
+            if device.get("transport") != "emulator":
+                continue
+            serial = str(device.get("serial", "")).strip()
+            if device.get("state") == "device":
+                fallback_serial = serial
+            if serial and serial not in existing_serials and device.get("state") == "device":
+                return serial
+        _time.sleep(2.0)
+    if fallback_serial:
+        return fallback_serial
+    raise MaestroAndroidError(
+        "DEVICE_ERROR",
+        f"Timed out waiting for emulator transport after {timeout_seconds} seconds.",
+    )
+
+
+def _wait_for_boot_completed(serial: str, timeout_seconds: int) -> None:
+    deadline = _time.time() + float(timeout_seconds)
+    while _time.time() < deadline:
+        completed = run_subprocess(
+            ["adb", "-s", serial, "shell", "getprop", "sys.boot_completed"],
+            capture_output=True,
+            check=False,
+        )
+        if (completed.stdout or "").strip() == "1":
+            pm_ready = run_subprocess(
+                ["adb", "-s", serial, "shell", "pm", "path", "android"],
+                capture_output=True,
+                check=False,
+            )
+            if pm_ready.returncode == 0:
+                return
+        _time.sleep(2.0)
+    raise MaestroAndroidError(
+        "DEVICE_ERROR",
+        f"Timed out waiting for emulator {serial} to finish booting after {timeout_seconds} seconds.",
+    )
+
+
 def _run_start_device(parsed: argparse.Namespace) -> None:
     emulator_bin = shutil.which("emulator")
     if emulator_bin is None:
@@ -1778,9 +2960,17 @@ def _run_start_device(parsed: argparse.Namespace) -> None:
             "CONFIG_ERROR", "Multiple AVDs detected; pass an AVD name."
         )
     print_step(f"Starting AVD {avd_name}")
+    existing_emulators = {
+        str(device.get("serial", "")).strip()
+        for device in _list_devices()
+        if device.get("transport") == "emulator"
+    }
     subprocess.Popen([emulator_bin, "-avd", avd_name], cwd=str(_project_root(parsed)))
     timeout = parsed.boot_timeout_seconds
     run_subprocess(["adb", "wait-for-device"], timeout_seconds=timeout)
+    serial = _wait_for_new_emulator(existing_emulators, timeout)
+    _wait_for_boot_completed(serial, timeout)
+    print_step(f"Emulator ready: {serial}")
 
 
 def _run_suggest(
@@ -1814,15 +3004,22 @@ def _run_suggest(
     if has_compose_ui or has_strings:
         suggestions.append("maestro-android lane smoke               # UI smoke after composable/string changes")
     if has_native:
-        suggestions.append("./gradlew connectedDebugAndroidTest      # native bridge validation")
+        suggestions.append("maestro-android lane smoke --device <serial>  # pinned runtime/native validation on one target")
     if has_test_flows:
         suggestions.append("maestro-android lint                     # validate flow health after flow edits")
         suggestions.append("maestro-android audit-selectors          # check selector coverage")
+        changed_cloud_flows = [
+            f for f in changed if f.endswith((".yaml", ".yml")) and "maestro-cloud" in f
+        ]
+        if len(changed_cloud_flows) == 1:
+            suggestions.append(
+                f"maestro-android cloud probe --flow {changed_cloud_flows[0]}  # narrow hosted rerun"
+            )
     if has_kotlin and not has_native:
-        suggestions.append("maestro-android suggest                  # broader pre-merge analysis")
+        suggestions.append("maestro-android lane smoke --device <serial>  # one explicit device confirmation")
 
     if not suggestions:
-        suggestions.append("./gradlew testDebugUnitTest              # default: compile + unit tests")
+        suggestions.append("maestro-android doctor                   # default environment and matrix check")
 
     print_step(f"Changed files: {len(changed)}")
     for f in changed[:15]:
@@ -1834,6 +3031,378 @@ def _run_suggest(
     for s in suggestions:
         print(f"  {s}")
     return 0
+
+
+def _app_storage_dir(app_id: str, storage: str) -> str:
+    if storage == "media":
+        return f"/sdcard/Android/media/{app_id}"
+    return f"/sdcard/Android/data/{app_id}/files"
+
+
+def _app_external_data_dir(app_id: str) -> str:
+    return _app_storage_dir(app_id, "data")
+
+
+def _resolve_app_pid(serial: str, app_id: str) -> str | None:
+    completed = run_subprocess(
+        ["adb", "-s", serial, "shell", "pidof", "-s", app_id],
+        capture_output=True, check=False,
+    )
+    pid = (completed.stdout or "").strip().replace("\r", "")
+    return pid if pid and pid.isdigit() else None
+
+
+def _run_device_files(
+    parsed: argparse.Namespace, config: MaestroAndroidConfig
+) -> int:
+    serial = _resolve_serial(parsed.device)
+    base = _app_storage_dir(config.project.app_id, parsed.storage)
+    target = f"{base}/{parsed.path}".rstrip("/") if parsed.path else base
+    flags = "-la" if parsed.show_all else "-l"
+    completed = run_subprocess(
+        ["adb", "-s", serial, "shell", "ls", flags, target],
+        capture_output=True, check=False,
+    )
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip()
+        if "No such file" in stderr:
+            print_step(f"Path does not exist on device: {target}")
+            return 1
+        print_step(f"Error listing files: {stderr}")
+        return 1
+    print(completed.stdout or "")
+    return 0
+
+
+def _run_device_push(
+    parsed: argparse.Namespace, config: MaestroAndroidConfig
+) -> int:
+    serial = _resolve_serial(parsed.device)
+    local = Path(parsed.local_path)
+    if not local.exists():
+        raise MaestroAndroidError("CONFIG_ERROR", f"Local file does not exist: {local}")
+    base = _app_storage_dir(config.project.app_id, parsed.storage)
+    if parsed.dest:
+        remote = f"{base}/{parsed.dest.rstrip('/')}/{local.name}" if not parsed.dest.endswith(local.name) else f"{base}/{parsed.dest}"
+    else:
+        remote = f"{base}/{local.name}"
+    run_subprocess(
+        ["adb", "-s", serial, "push", str(local), remote],
+        capture_output=False,
+    )
+    print_step(f"Pushed {local.name} -> {remote}")
+    return 0
+
+
+def _run_device_logcat(
+    parsed: argparse.Namespace, config: MaestroAndroidConfig
+) -> int:
+    serial = _resolve_serial(parsed.device)
+    pid = _resolve_app_pid(serial, config.project.app_id)
+    if pid is None:
+        raise MaestroAndroidError(
+            "DEVICE_ERROR",
+            f"App process not running: {config.project.app_id}. Launch the app first.",
+        )
+    filter_regex = parsed.logcat_filter
+    filter_pattern = re.compile(filter_regex) if filter_regex else None
+
+    if parsed.follow:
+        print_step(
+            f"Streaming logcat for {config.project.app_id} (pid {pid})"
+            + (f" filter=/{filter_regex}/" if filter_regex else "")
+        )
+        command = ["adb", "-s", serial, "logcat", f"--pid={pid}"]
+        proc = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, errors="replace",
+        )
+        save_file = parsed.save.open("w", encoding="utf-8") if parsed.save else None
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                if filter_pattern and not filter_pattern.search(line):
+                    continue
+                print(line, end="")
+                if save_file:
+                    save_file.write(line)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+            if save_file:
+                save_file.close()
+                print_step(f"Saved logcat to {parsed.save}")
+        return 0
+
+    completed = run_subprocess(
+        ["adb", "-s", serial, "logcat", "-d", f"--pid={pid}"],
+        capture_output=True, check=False,
+    )
+    lines = (completed.stdout or "").splitlines()
+    if filter_pattern:
+        lines = [line for line in lines if filter_pattern.search(line)]
+    if parsed.lines > 0:
+        lines = lines[-parsed.lines:]
+    output = "\n".join(lines)
+    if parsed.save:
+        parsed.save.write_text(output + "\n", encoding="utf-8")
+        print_step(f"Saved {len(lines)} lines to {parsed.save}")
+    else:
+        print(output)
+    print_step(f"{len(lines)} lines" + (f" matching /{filter_regex}/" if filter_regex else ""))
+    return 0
+
+
+def _run_device_ui(
+    parsed: argparse.Namespace, config: MaestroAndroidConfig
+) -> int:
+    serial = _resolve_serial(parsed.device)
+    completed = run_subprocess(
+        ["adb", "-s", serial, "exec-out", "uiautomator", "dump", "/dev/tty"],
+        capture_output=True, check=False,
+    )
+    raw = (completed.stdout or "").replace("UI hierchary dumped to: /dev/tty", "").strip()
+    if not raw:
+        print_step("No UI hierarchy returned. Is the screen on?")
+        return 1
+
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        print(raw)
+        return 0
+
+    nodes: list[dict[str, str]] = []
+    for elem in root.iter("node"):
+        resource_id = elem.get("resource-id", "")
+        text = elem.get("text", "")
+        content_desc = elem.get("content-desc", "")
+        bounds = elem.get("bounds", "")
+        class_name = elem.get("class", "")
+        if not resource_id and not text and not content_desc:
+            continue
+        nodes.append({
+            "resource_id": resource_id,
+            "text": text[:60],
+            "content_desc": content_desc[:60],
+            "bounds": bounds,
+            "class": class_name.rsplit(".", 1)[-1] if "." in class_name else class_name,
+        })
+
+    print(f"  {'resource-id':<45} {'text':<30} {'class':<20} {'bounds'}")
+    print(f"  {'-' * 45} {'-' * 30} {'-' * 20} {'-' * 25}")
+    for node in nodes:
+        rid = node["resource_id"].split("/")[-1] if "/" in node["resource_id"] else node["resource_id"]
+        label = node["text"] or node["content_desc"] or ""
+        print(f"  {rid:<45} {label:<30} {node['class']:<20} {node['bounds']}")
+
+    print()
+    ids = [n["resource_id"].split("/")[-1] for n in nodes if n["resource_id"]]
+    print_step(f"UI dump: {len(nodes)} elements, {len(ids)} with resource-id")
+    return 0
+
+
+def _run_device_foreground(
+    parsed: argparse.Namespace, config: MaestroAndroidConfig
+) -> int:
+    serial = _resolve_serial(parsed.device)
+    snapshot = _collect_foreground_snapshot(serial, config.project.app_id)
+    if getattr(parsed, "foreground_as_json", False):
+        print(json.dumps(snapshot, indent=2))
+        return 0
+
+    print(f"  Device:         {serial}")
+    print(f"  App:            {config.project.app_id}")
+    print(f"  Classification: {snapshot['classification']}")
+    print(f"  Package:        {snapshot['package'] or 'unknown'}")
+    print(f"  Activity:       {snapshot['activity'] or 'unknown'}")
+    if snapshot["component"]:
+        print(f"  Component:      {snapshot['component']}")
+
+    if snapshot["classification"] == "system_permission_dialog":
+        print()
+        print_step("A system permission dialog is currently on top of the app.")
+    elif snapshot["classification"] == "play_store":
+        print()
+        print_step("The Play Store currently owns the foreground.")
+    elif snapshot["classification"] == "external":
+        print()
+        print_step("Another package currently owns the foreground.")
+    elif snapshot["classification"] == "app":
+        print()
+        print_step("The app currently owns the foreground.")
+    else:
+        print()
+        print_step("Unable to determine the current foreground activity.")
+    return 0
+
+
+def _run_device_info(
+    parsed: argparse.Namespace, config: MaestroAndroidConfig
+) -> int:
+    serial = _resolve_serial(parsed.device)
+    app_id = config.project.app_id
+    pid = _resolve_app_pid(serial, app_id)
+
+    print(f"  App:     {app_id}")
+    print(f"  Device:  {serial}")
+    if pid is None:
+        print(f"  Process: NOT RUNNING")
+        return 1
+
+    print(f"  PID:     {pid}")
+
+    meminfo = run_subprocess(
+        ["adb", "-s", serial, "shell", "dumpsys", "meminfo", pid],
+        capture_output=True, check=False,
+    )
+    for line in (meminfo.stdout or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("TOTAL") and "TOTAL:" not in stripped:
+            parts = stripped.split()
+            if len(parts) >= 2:
+                try:
+                    kb = int(parts[1].replace(",", ""))
+                    print(f"  Memory:  {kb // 1024} MB ({kb} KB)")
+                except ValueError:
+                    pass
+            break
+
+    cpu_out = run_subprocess(
+        ["adb", "-s", serial, "shell", "top", "-b", "-n", "1", "-p", pid],
+        capture_output=True, check=False, timeout_seconds=10,
+    )
+    cpu_header_idx: int | None = None
+    for line in (cpu_out.stdout or "").splitlines():
+        stripped = line.strip()
+        if "PID" in stripped and "CPU" in stripped:
+            headers = stripped.split()
+            for i, h in enumerate(headers):
+                if h.startswith("CPU") or h == "%CPU":
+                    cpu_header_idx = i
+                    break
+        elif pid in stripped and cpu_header_idx is not None:
+            parts = stripped.split()
+            if cpu_header_idx < len(parts):
+                print(f"  CPU:     {parts[cpu_header_idx]}%")
+            break
+
+    print()
+    print_step("App process is running.")
+    return 0
+
+
+def _classify_probe_result(
+    *,
+    transport_ok: bool,
+    maestro_result: dict[str, Any] | None,
+    artifact_root: Path | None,
+) -> str:
+    if not transport_ok:
+        return "device_transport_failure"
+    if maestro_result is None:
+        return "adb_ready"
+    if maestro_result.get("status") == "passed":
+        return "ready"
+    if artifact_root is None:
+        return "harness_bootstrap_failure"
+    stderr_rel = str(maestro_result.get("stderr") or "")
+    logcat_rel = str(maestro_result.get("logcat") or "")
+    texts_to_scan: list[str] = []
+    for rel in (stderr_rel, logcat_rel):
+        if not rel:
+            continue
+        path = artifact_root / rel
+        if path.exists():
+            texts_to_scan.append(path.read_text(encoding="utf-8", errors="replace"))
+    combined = "\n".join(texts_to_scan)
+    if re.search(r"Unable to launch app|app.*not installed", combined, re.IGNORECASE):
+        return "product_or_app_failure"
+    if re.search(r"UNAVAILABLE|Connection refused|Connection reset|timed out", combined, re.IGNORECASE):
+        return "harness_bootstrap_failure"
+    return "unknown_failure"
+
+
+def _run_device_probe(parsed: argparse.Namespace, config: MaestroAndroidConfig, project_root: Path) -> int:
+    serial = _resolve_serial(parsed.device)
+    transport = run_subprocess(
+        ["adb", "-s", serial, "shell", "echo", "maestro-android-ok"],
+        capture_output=True,
+        check=False,
+        timeout_seconds=15,
+    )
+    transport_ok = transport.returncode == 0 and "maestro-android-ok" in (transport.stdout or "")
+    foreground = _collect_foreground_snapshot(serial, config.project.app_id)
+    artifact_root: Path | None = None
+    maestro_result: dict[str, Any] | None = None
+    if not parsed.adb_only:
+        artifact_root = _normalize_artifact_root(
+            project_root / ".maestro-android" / "lifecycle", serial, "bootstrap-probe"
+        )
+        artifact_root.mkdir(parents=True, exist_ok=True)
+        probe_flow = artifact_root / "bootstrap-probe.yaml"
+        probe_flow.write_text(
+            "\n".join(
+                [
+                    f"appId: {config.project.app_id}",
+                    "---",
+                    "- launchApp",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        maestro_result = _run_maestro_flow(
+            project_root=project_root,
+            serial=serial,
+            flow=probe_flow,
+            app_id=config.project.app_id,
+            clear_state=False,
+            output_format="junit",
+            artifact_root=artifact_root,
+            adb_timeout_sec=30,
+            maestro_timeout_sec=180,
+        )
+        if maestro_result.get("status") != "passed":
+            _diagnose_failure(maestro_result, artifact_root)
+    classification = _classify_probe_result(
+        transport_ok=transport_ok,
+        maestro_result=maestro_result,
+        artifact_root=artifact_root,
+    )
+    payload = {
+        "serial": serial,
+        "transport_ok": transport_ok,
+        "transport_kind": _device_transport_kind(serial),
+        "foreground": foreground,
+        "classification": classification,
+        "artifact_root": str(artifact_root) if artifact_root is not None else None,
+        "maestro_probe": maestro_result,
+    }
+    if getattr(parsed, "probe_as_json", False):
+        print(json.dumps(payload, indent=2))
+    else:
+        print(f"  Device:         {serial}")
+        print(f"  Transport:      {payload['transport_kind']}")
+        print(f"  ADB transport:  {'ok' if transport_ok else 'failed'}")
+        print(f"  Foreground:     {foreground.get('component') or 'unknown'}")
+        print(f"  Classification: {classification}")
+        if artifact_root is not None:
+            print(f"  Artifacts:      {artifact_root}")
+        print()
+        if classification == "ready":
+            print_step("Pinned device bootstrap probe passed.")
+        elif classification == "adb_ready":
+            print_step("ADB transport is healthy. Maestro bootstrap was skipped.")
+        elif classification == "harness_bootstrap_failure":
+            print_step("ADB is up, but the Maestro bootstrap path failed. Inspect the artifact bundle before rerunning.")
+        elif classification == "product_or_app_failure":
+            print_step("Maestro attached, but the app could not launch cleanly. Fix the app/install state, not the transport.")
+        else:
+            print_step("Probe failed. Inspect the artifact bundle and foreground snapshot before retrying.")
+    return 0 if classification in {"ready", "adb_ready"} else 1
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1848,7 +3417,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if parsed.command == "doctor":
             return _run_doctor(parsed, config)
         if parsed.command == "devices":
-            _run_devices()
+            _run_devices(parsed)
             return 0
         if parsed.command == "start-device":
             _run_start_device(parsed)
@@ -1883,6 +3452,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_cloud(parsed, config, project_root)
         if parsed.command == "suggest":
             return _run_suggest(parsed, config, project_root)
+        if parsed.command == "device":
+            if parsed.device_command == "files":
+                return _run_device_files(parsed, config)
+            if parsed.device_command == "push":
+                return _run_device_push(parsed, config)
+            if parsed.device_command == "logcat":
+                return _run_device_logcat(parsed, config)
+            if parsed.device_command == "ui":
+                return _run_device_ui(parsed, config)
+            if parsed.device_command == "foreground":
+                return _run_device_foreground(parsed, config)
+            if parsed.device_command == "info":
+                return _run_device_info(parsed, config)
+            if parsed.device_command == "probe":
+                return _run_device_probe(parsed, config, project_root)
+            raise MaestroAndroidError("CONFIG_ERROR", f"Unknown device command '{parsed.device_command}'")
         raise MaestroAndroidError("CONFIG_ERROR", f"Unknown command '{parsed.command}'")
     except MaestroAndroidError as exc:
         print(f"{exc.code}: {exc.message}")
